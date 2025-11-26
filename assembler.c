@@ -110,6 +110,15 @@ static int origin = 0;
 static int g_eval_pc = 0;     /* current PC for expression evaluation (supports '*') */
 static int allow_illegal = 0; /* enable unofficial/illegal opcodes */
 
+/* Local temporary labels support ("-" backward and "+" forward) */
+static int minus_idx[MAX_LINES];
+static int minus_pc[MAX_LINES];
+static int minus_count = 0;
+static int plus_idx[MAX_LINES];
+static int plus_pc[MAX_LINES];
+static int plus_count = 0;
+static int current_line_index = -1; /* used during second pass to resolve +/- */
+
 /* Include handling */
 #define MAX_INCLUDE_DEPTH 64
 static int include_depth = 0;
@@ -117,7 +126,6 @@ static int include_depth = 0;
 /* Forward decl: loader that expands includes into global lines[] */
 static void read_file_with_includes(const char *path);
 static void expand_include(const char *including_path, const char *arg, int lineno);
-
 /* Forward declaration for opcode lookup used during parsing */
 const opcode_t *opcode_lookup(const char *mn, addrmode_t mode);
 /* Forward declaration: parse expression involving +, -, parentheses. */
@@ -988,13 +996,13 @@ asm_line_t *parse_line(const char *in, int lineno)
     /* Branch mnemonics always use relative addressing */
     if (ln->mnemonic &&
             (strcasecmp(ln->mnemonic, "bcc") == 0 ||
-            strcasecmp(ln->mnemonic, "bcs") == 0 ||
-            strcasecmp(ln->mnemonic, "beq") == 0 ||
-            strcasecmp(ln->mnemonic, "bmi") == 0 ||
-            strcasecmp(ln->mnemonic, "bne") == 0 ||
-            strcasecmp(ln->mnemonic, "bpl") == 0 ||
-            strcasecmp(ln->mnemonic, "bvc") == 0 ||
-            strcasecmp(ln->mnemonic, "bvs") == 0))
+             strcasecmp(ln->mnemonic, "bcs") == 0 ||
+             strcasecmp(ln->mnemonic, "beq") == 0 ||
+             strcasecmp(ln->mnemonic, "bmi") == 0 ||
+             strcasecmp(ln->mnemonic, "bne") == 0 ||
+             strcasecmp(ln->mnemonic, "bpl") == 0 ||
+             strcasecmp(ln->mnemonic, "bvc") == 0 ||
+             strcasecmp(ln->mnemonic, "bvs") == 0))
     {
         ln->op.mode = AM_RELATIVE;
     }
@@ -1273,7 +1281,124 @@ const opcode_t *opcode_lookup(const char *mn, addrmode_t mode)
     return NULL;
 }
 
+/* Human-readable addressing mode for diagnostics */
+static const char *addrmode_str(addrmode_t m)
+{
+    switch (m) {
+        case AM_NONE:
+            return "implicit";
+
+        case AM_IMMEDIATE:
+            return "immediate";
+
+        case AM_ZEROPAGE:
+            return "zeropage";
+
+        case AM_ZEROPAGE_X:
+            return "zeropage,X";
+
+        case AM_ZEROPAGE_Y:
+            return "zeropage,Y";
+
+        case AM_ABSOLUTE:
+            return "absolute";
+
+        case AM_ABSOLUTE_X:
+            return "absolute,X";
+
+        case AM_ABSOLUTE_Y:
+            return "absolute,Y";
+
+        case AM_INDIRECT:
+            return "(indirect)";
+
+        case AM_INDIRECT_X:
+            return "(indirect,X)";
+
+        case AM_INDIRECT_Y:
+            return "(indirect),Y";
+
+        case AM_RELATIVE:
+            return "relative";
+
+        case AM_ACCUMULATOR:
+            return "accumulator";
+
+        default:
+            return "unknown";
+    }
+}
+
 /* ------------ Small helpers to simplify passes ------------ */
+/* Resolve local temporary labels '-' (previous) and '+' (next) relative to a line index. */
+/* s = "-", "--", ... or "+", "++", ... detection */
+static int parse_local_ref(const char *s, char *kind, int *count)
+{
+    if (!s || !*s) {
+        return 0;
+    }
+
+    char c = s[0];
+    if (c != '-' && c != '+') {
+        return 0;
+    }
+
+    int n = 0;
+
+    for (const char *p = s; *p; ++p) {
+        if (*p != c) {
+            return 0;
+        }
+        n++;
+    }
+
+    if (n <= 0) {
+        return 0;
+    }
+
+    if (kind) {
+        *kind = c;
+    }
+
+    if (count) {
+        *count = n;
+    }
+
+    return 1;
+}
+
+static int resolve_minus_addr_k(int line_index, int k, int *out_addr)
+{
+    for (int m = minus_count - 1; m >= 0; --m) {
+        if (minus_idx[m] < line_index) {
+            k--;
+
+            if (k == 0) {
+                if (out_addr) *out_addr = minus_pc[m];
+                return 1;
+            }
+        }
+    }
+
+    return 0; /* not enough previous '-' labels */
+}
+
+static int resolve_plus_addr_k(int line_index, int k, int *out_addr)
+{
+    for (int p = 0; p < plus_count; ++p) {
+        if (plus_idx[p] > line_index) {
+            k--;
+
+            if (k == 0) {
+                if (out_addr) *out_addr = plus_pc[p];
+                return 1;
+            }
+        }
+    }
+
+    return 0; /* not enough next '+' labels */
+}
+
 static int is_org(const asm_line_t *ln)
 {
     return (ln->mnemonic && ((strcasecmp(ln->mnemonic, ".org") == 0) ||
@@ -1378,6 +1503,7 @@ static void first_handle_incbin(const asm_line_t *ln, int *pc)
     if (*fn == '"' || *fn == '\'') {
         fn++;
         char *qe = strrchr(fn, fn[-1]);
+
         if (qe) {
             *qe = '\0';
         }
@@ -1435,6 +1561,7 @@ static void first_handle_text(const asm_line_t *ln, int *pc)
     if (!end) {
         asm_error_file(ln->filename, ln->lineno, "Unterminated string in .text");
     }
+
     *end = '\0';
 
     *pc += (int)strlen(t);
@@ -1443,6 +1570,7 @@ static void first_handle_text(const asm_line_t *ln, int *pc)
 static void first_handle_instruction(const asm_line_t *ln, int *pc)
 {
     const opcode_t *op = opcode_lookup(ln->mnemonic, ln->op.mode);
+
     /* Fallback: if ZEROPAGE,Y isn't supported for this mnemonic, try ABSOLUTE,Y. */
     if (!op && ln->op.mode == AM_ZEROPAGE_Y) {
         const opcode_t *alt = opcode_lookup(ln->mnemonic, AM_ABSOLUTE_Y);
@@ -1452,9 +1580,10 @@ static void first_handle_instruction(const asm_line_t *ln, int *pc)
             op = alt;
         }
     }
+
     if (!op) {
-        asm_error_file(ln->filename, ln->lineno, "Invalid opcode or addressing mode: %s %s",
-                ln->mnemonic, (ln->op.expr ? ln->op.expr : "(no operand)"));
+        asm_error_file(ln->filename, ln->lineno, "%s does not support %s addressing",
+                ln->mnemonic, addrmode_str(ln->op.mode));
     }
 
     *pc += op->length;
@@ -1463,6 +1592,7 @@ static void first_handle_instruction(const asm_line_t *ln, int *pc)
 static void first_handle_define(const asm_line_t *ln, int *pc)
 {
     (void)pc; /* PC does not change for a define */
+
     if (!ln->def_name || !ln->def_expr) {
         asm_error_file(ln->filename, ln->lineno, "Malformed define");
     }
@@ -1499,6 +1629,9 @@ void first_pass(void)
     DEBUG_PRINT("First pass...\n");
 
     int pc = origin;
+    /* reset +/- markers */
+    minus_count = 0;
+    plus_count = 0;
 
     for (int i = 0; i < line_count; i++) {
         asm_line_t *ln = lines[i];
@@ -1507,8 +1640,35 @@ void first_pass(void)
         }
 
         if (ln->label) {
-            DEBUG_PRINT("Found label: \"%s\" at 0x%04x\n", ln->label, pc);
-            sym_add(ln->label, pc, ln->filename, ln->lineno);
+            /* Accept sequences of '-' or '+' as local temp labels too */
+            int all_minus = 1;
+            int all_plus = 1;
+            for (const char *p = ln->label; *p; ++p) {
+                if (*p != '-') {
+                    all_minus = 0;
+                }
+
+                if (*p != '+') {
+                    all_plus = 0;
+                }
+            }
+
+            if (all_minus && *ln->label) {
+                if (minus_count < MAX_LINES) {
+                    minus_idx[minus_count] = i;
+                    minus_pc[minus_count] = pc;
+                    minus_count++;
+                }
+            } else if (all_plus && *ln->label) {
+                if (plus_count < MAX_LINES) {
+                    plus_idx[plus_count] = i;
+                    plus_pc[plus_count] = pc;
+                    plus_count++;
+                }
+            } else {
+                DEBUG_PRINT("Found label: \"%s\" at 0x%04x\n", ln->label, pc);
+                sym_add(ln->label, pc, ln->filename, ln->lineno);
+            }
         }
 
         if (!ln->mnemonic) {
@@ -1626,7 +1786,18 @@ static void second_handle_byte(const asm_line_t *ln, int *pc)
         int v;
         g_eval_pc = *pc;
 
-        if (parse_number(t, &v) || eval_expr(t, &v)) {
+        char kind; int n;
+        if (parse_local_ref(t, &kind, &n)) {
+            if (kind == '-') {
+                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found in .byte");
+                }
+            } else {
+                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found in .byte");
+                }
+            }
+        } else if (parse_number(t, &v) || eval_expr(t, &v)) {
             if (v < 0 || v > BYTE_MAX) {
                 asm_error_file(ln->filename, ln->lineno, ".byte value %d out of 8-bit range", v);
             }
@@ -1663,7 +1834,18 @@ static void second_handle_word(const asm_line_t *ln, int *pc)
         int v;
         g_eval_pc = *pc;
 
-        if (parse_number(t, &v) || eval_expr(t, &v)) {
+        char kind; int n;
+        if (parse_local_ref(t, &kind, &n)) {
+            if (kind == '-') {
+                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found in .word");
+                }
+            } else {
+                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found in .word");
+                }
+            }
+        } else if (parse_number(t, &v) || eval_expr(t, &v)) {
             if (v < 0 || v > WORD_MAX) {
                 asm_error_file(ln->filename, ln->lineno, ".word value %d out of 16-bit range", v);
             }
@@ -1717,6 +1899,7 @@ static void second_handle_text(const asm_line_t *ln, int *pc)
 static void second_emit_instruction(const asm_line_t *ln, int *pc)
 {
     const opcode_t *op = opcode_lookup(ln->mnemonic, ln->op.mode);
+
     /* Fallback: if ZEROPAGE,Y isn't supported for this mnemonic, try ABSOLUTE,Y. */
     if (!op && ln->op.mode == AM_ZEROPAGE_Y) {
         const opcode_t *alt = opcode_lookup(ln->mnemonic, AM_ABSOLUTE_Y);
@@ -1726,8 +1909,8 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
         }
     }
     if (!op) {
-        asm_error_file(ln->filename, ln->lineno, "Cannot assemble %s with mode %d", ln->mnemonic,
-                ln->op.mode);
+        asm_error_file(ln->filename, ln->lineno, "%s does not support %s addressing",
+                ln->mnemonic, addrmode_str(ln->op.mode));
     }
 
     emit_byte(*pc, op->opcode);
@@ -1743,16 +1926,30 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
                         int target;
 
                         if (ln->op.expr) {
-                            int tmp;
-                            g_eval_pc = *pc;
-
-                            if (eval_expr(ln->op.expr, &tmp) || parse_number(ln->op.expr, &tmp)) {
-                                target = tmp;
+                            /* Handle local temporary labels: '-', '--', and '+', '++' */
+                            char kind; int n;
+                            if (parse_local_ref(ln->op.expr, &kind, &n)) {
+                                if (kind == '-') {
+                                    if (!resolve_minus_addr_k(current_line_index, n, &target)) {
+                                        asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
+                                    }
+                                } else {
+                                    if (!resolve_plus_addr_k(current_line_index, n, &target)) {
+                                        asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
+                                    }
+                                }
                             } else {
-                                target = sym_lookup(ln->op.expr);
-                                if (target < 0) {
-                                    asm_error_file(ln->filename, ln->lineno, "Undefined label %s for branch",
+                                int tmp;
+                                g_eval_pc = *pc;
+
+                                if (eval_expr(ln->op.expr, &tmp) || parse_number(ln->op.expr, &tmp)) {
+                                    target = tmp;
+                                } else {
+                                    target = sym_lookup(ln->op.expr);
+                                    if (target < 0) {
+                                        asm_error_file(ln->filename, ln->lineno, "Undefined label %s for branch",
                                             ln->op.expr);
+                                    }
                                 }
                             }
                         } else {
@@ -1770,7 +1967,18 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
                         if (ln->op.expr) {
                             g_eval_pc = *pc;
 
-                            if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
+                            char kind; int n;
+                            if (parse_local_ref(ln->op.expr, &kind, &n)) {
+                                if (kind == '-') {
+                                    if (!resolve_minus_addr_k(current_line_index, n, &v)) {
+                                        asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
+                                    }
+                                } else {
+                                    if (!resolve_plus_addr_k(current_line_index, n, &v)) {
+                                        asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
+                                    }
+                                }
+                            } else if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
                                 /* ok */
                             } else {
                                 int s = sym_lookup(ln->op.expr);
@@ -1802,7 +2010,18 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
                     if (ln->op.expr) {
                         g_eval_pc = *pc;
 
-                        if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
+                        char kind; int n;
+                        if (parse_local_ref(ln->op.expr, &kind, &n)) {
+                            if (kind == '-') {
+                                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
+                                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
+                                }
+                            } else {
+                                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
+                                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
+                                }
+                            }
+                        } else if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
                             /* ok */
                         } else {
                             int s = sym_lookup(ln->op.expr);
@@ -1839,6 +2058,7 @@ void second_pass(void)
 
     for (int i = 0; i < line_count; i++) {
         asm_line_t *ln = lines[i];
+        current_line_index = i;
 
         if (!ln || !ln->mnemonic) {
             continue;
@@ -1933,6 +2153,7 @@ static void expand_include(const char *including_path, const char *arg, int line
     if (*fn == '"' || *fn == '\'') {
         char quote = *fn++;
         char *qe = strrchr(fn, quote);
+
         if (qe) {
             *qe = '\0';
         }
@@ -1990,6 +2211,7 @@ static void read_file_with_includes(const char *path)
 
     while (fgets(linebuf, sizeof(linebuf), fin)) {
         lineno++;
+
         asm_line_t *ln = parse_line(linebuf, lineno);
         if (!ln) {
             continue;

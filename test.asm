@@ -84,6 +84,21 @@ hello:
 singleq:
     .text 'ABC xyz'        ; single quotes also accepted
 
+; Local temporary labels: '-', '--', '+' and '++'
+.org $3400
+; Backward references with '-' and '--'
+    LDX #$00
+-   INX                 ; first '-'
+-   DEX                 ; second '-'
+    BNE --              ; branch to first '-' (INX)
+    NOP
+
+; Forward references with '+' and '++'
+    LDX #$00
+    BEQ ++              ; skip to second '+' (RTS)
++   NOP                 ; first '+'
++   RTS                 ; second '+'
+
 ; -----------------------------------------------------------------------------
 ; Exhaustive tests for all legal opcodes and addressing modes
 ; -----------------------------------------------------------------------------

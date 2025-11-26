@@ -27,6 +27,22 @@ Expressions
 - Low/High byte operators: '<expr' yields the low byte, '>expr' yields the high byte (e.g., 'LDA #<label', 'LDA #>label').
 - Range checking: values outside 8‑bit/16‑bit ranges cause errors (no truncation).
 
+Local Temporary Labels
+- Use '-' to mark a backward target and '+' to mark a forward target.
+- Use '--' to refer to the second previous '-' and '++' to refer to the second next '+'. Longer runs work similarly (nth previous/next).
+- Reuse them multiple times; references pick by proximity and count.
+- Example:
+  ldx #$00
+ - inx
+   bne -
+
+  ldx #$00
+ - lda $c000,x
+   beq +
+   inx
+   bne -
+ + rts
+
 CLI Options
 - '--prg-header | -H': write 2‑byte load address header (default).
 - '--no-prg-header | -N': disable load address header.
