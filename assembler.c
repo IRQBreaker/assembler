@@ -95,6 +95,18 @@ typedef struct opcode_t
     int length;
 } opcode_t;
 
+/* Central directive classifier used by both passes */
+typedef enum dir_kind
+{
+    DIR_NONE = 0,
+    DIR_DEFINE,
+    DIR_ORG,
+    DIR_INCBIN,
+    DIR_BYTE,
+    DIR_WORD,
+    DIR_TEXT
+} dir_kind_t;
+
 /* Globals */
 static asm_line_t *lines[MAX_LINES];
 static int line_count = 0;
@@ -571,6 +583,142 @@ int parse_number(const char *s, int *out)
  * and either capture a literal value or keep the expression string to
  * resolve later in the second pass.
  */
+/* ---- Helpers to flatten parse_operand ---- */
+static int set_immediate_operand(const char *s, operand_t *op)
+{
+    if (*s != CHAR_HASH) {
+        return 0;
+    }
+
+    const char *rest = s + 1;
+
+    int v;
+
+    op->mode = AM_IMMEDIATE;
+
+    if (parse_number(rest, &v)) {
+        op->value = v;
+    } else {
+        op->expr = strdup(rest);
+    }
+
+    return 1;
+}
+
+static int set_accumulator_operand(const char *s, operand_t *op)
+{
+    if (!(strcmp(s, "A") == 0 || strcmp(s, "a") == 0)) {
+        return 0;
+    }
+
+    op->mode = AM_ACCUMULATOR;
+
+    return 1;
+}
+
+static int set_indirect_operand(char *s, operand_t *op)
+{
+    if (*s != CHAR_LPAREN) {
+        return 0;
+    }
+
+    char *rparen = strrchr(s, ')');
+    if (!rparen) {
+        asm_error(0, "Malformed indirect operand: %s", s);
+    }
+
+    *rparen = '\0';
+    char *inside = s + 1;
+    char *after = trimws(rparen + 1);
+
+    /* (expr),Y */
+    if (*after == ',') {
+        char *p = trimws(after + 1);
+
+        if (toupper((unsigned char)*p) == 'Y') {
+            int v;
+            op->mode = AM_INDIRECT_Y;
+
+            if (parse_number(inside, &v)) {
+                op->value = v;
+            } else {
+                op->expr = strdup(inside);
+            }
+
+            return 1;
+        }
+    }
+
+    /* (expr,X) */
+    char *comma_in = strchr(inside, CHAR_COMMA);
+    if (comma_in) {
+        *comma_in = '\0';
+        char *base = trimws(inside);
+        char *p = trimws(comma_in + 1);
+
+        if (toupper((unsigned char)*p) == 'X') {
+            int v;
+            op->mode = AM_INDIRECT_X;
+
+            if (parse_number(base, &v)) {
+                op->value = v;
+            } else {
+                op->expr = strdup(base);
+            }
+
+            return 1;
+        }
+    }
+
+    /* pure (expr) */
+    int v;
+    op->mode = AM_INDIRECT;
+    if (parse_number(inside, &v)) {
+        op->value = v;
+    } else {
+        op->expr = strdup(inside);
+    }
+
+    return 1;
+}
+
+static int set_indexed_operand(char *s, operand_t *op, const char *orig)
+{
+    char *comma = strchr(s, CHAR_COMMA);
+    if (!comma) {
+        return 0;
+    }
+
+    *comma = '\0';
+    char *base = trimws(s);
+    char *p = trimws(comma + 1);
+    char reg = toupper((unsigned char)*p);
+
+    int v;
+
+    if (parse_number(base, &v)) {
+        if (reg == 'X') {
+            op->mode = (v <= BYTE_MAX) ? AM_ZEROPAGE_X : AM_ABSOLUTE_X;
+            op->value = v;
+        } else if (reg == 'Y') {
+            op->mode = (v <= BYTE_MAX) ? AM_ZEROPAGE_Y : AM_ABSOLUTE_Y;
+            op->value = v;
+        } else {
+            asm_error(0, "Unknown suffix register %c in %s", reg, orig);
+        }
+    } else {
+        if (reg == 'X') {
+            op->mode = AM_ABSOLUTE_X;
+        } else if (reg == 'Y') {
+            op->mode = AM_ABSOLUTE_Y;
+        }
+
+        op->expr = strdup(base);
+    }
+
+    return 1;
+}
+
 operand_t parse_operand(const char *s0)
 {
     operand_t op;
@@ -579,160 +727,42 @@ operand_t parse_operand(const char *s0)
     op.expr = NULL;
 
     if (!s0) {
-        op.mode = AM_NONE;
         return op;
     }
 
     char buf[STRING_BUF];
     strncpy(buf, s0, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
+
     char *s = trimws(buf);
-
     if (*s == '\0') {
-        op.mode = AM_NONE;
         return op;
     }
 
-    /* Immediate */
-    if (*s == CHAR_HASH) {
-        const char *rest = s + 1;
-        int v;
-        op.mode = AM_IMMEDIATE;
-        if (parse_number(rest, &v)) {
-            op.value = v;
-        } else {
-            op.expr = strdup(rest);
-        }
+    if (set_immediate_operand(s, &op)) {
         return op;
     }
 
-    /* Accumulator operand (explicit A) */
-    if ((strcmp(s, "A") == 0) || (strcmp(s, "a") == 0)) {
-        op.mode = AM_ACCUMULATOR;
+    if (set_accumulator_operand(s, &op)) {
         return op;
     }
 
-    /* Indirect parentheses */
-    if (*s == CHAR_LPAREN) {
-        char *rparen = strrchr(s, ')');
-        if (!rparen) {
-            asm_error(0, "Malformed indirect operand: %s", s);
-        }
-        *rparen = '\0';
-        char *inside = s + 1;
-        char *after = rparen + 1;
-        after = trimws(after);
-
-        /* (expr),Y — allow whitespace after comma, detected after ')' */
-        if (*after == ',') {
-            char *p = after + 1;
-            while (*p && isspace((unsigned char)*p)) {
-                p++;
-            }
-
-            if (toupper((unsigned char)*p) == 'Y') {
-                int v;
-                op.mode = AM_INDIRECT_Y;
-
-                if (parse_number(inside, &v)) {
-                    op.value = v;
-                } else {
-                    op.expr = strdup(inside);
-                }
-                return op;
-            }
-        }
-
-        /* (expr,X) — allow whitespace after comma, detected inside parentheses */
-        {
-            char *comma_in = strchr(inside, CHAR_COMMA);
-            if (comma_in) {
-                *comma_in = '\0';
-                char *base = trimws(inside);
-                char *p = trimws(comma_in + 1);
-
-                if (toupper((unsigned char)*p) == 'X') {
-                    int v;
-                    op.mode = AM_INDIRECT_X;
-
-                    if (parse_number(base, &v)) {
-                        op.value = v;
-                    } else {
-                        op.expr = strdup(base);
-                    }
-                    return op;
-                }
-            }
-        }
-
-        /* pure (expr) */
-        {
-            int v;
-            if (parse_number(inside, &v)) {
-                op.mode = AM_INDIRECT;
-                op.value = v;
-            } else {
-                op.mode = AM_INDIRECT;
-                op.expr = strdup(inside);
-            }
-            return op;
-        }
-    }
-
-    /* Check for comma suffix ,X or ,Y (allow whitespace after comma) */
-    char *comma = strchr(s, CHAR_COMMA);
-    if (comma) {
-        *comma = '\0';
-        char *base = trimws(s);
-        char *p = comma + 1;
-        p = trimws(p);
-        char reg = toupper((unsigned char)*p);
-        int v;
-
-        if (parse_number(base, &v)) {
-            if (reg == 'X') {
-                if (v <= BYTE_MAX) {
-                    op.mode = AM_ZEROPAGE_X;
-                } else {
-                    op.mode = AM_ABSOLUTE_X;
-                }
-                op.value = v;
-            } else if (reg == 'Y') {
-                if (v <= BYTE_MAX) {
-                    op.mode = AM_ZEROPAGE_Y;
-                } else {
-                    op.mode = AM_ABSOLUTE_Y;
-                }
-                op.value = v;
-            } else {
-                asm_error(0, "Unknown suffix register %c in %s", reg, s0);
-            }
-        } else {
-            if (reg == 'X') {
-                op.mode = AM_ABSOLUTE_X;
-            } else if (reg == 'Y') {
-                op.mode = AM_ABSOLUTE_Y;
-            }
-            op.expr = strdup(base);
-        }
-
+    if (set_indirect_operand(s, &op)) {
         return op;
     }
 
-    /* No comma, no parentheses, no #: treat as direct value or label */
-    {
-        int v;
-        if (parse_number(s, &v)) {
-            if (v <= BYTE_MAX) {
-                op.mode = AM_ZEROPAGE;
-            } else {
-                op.mode = AM_ABSOLUTE;
-            }
-            op.value = v;
-        } else {
-            op.mode = AM_ABSOLUTE;
-            op.expr = strdup(s);
-        }
+    if (set_indexed_operand(s, &op, s0)) {
+        return op;
+    }
+
+    /* Fallback: direct value or label */
+    int v;
+    if (parse_number(s, &v)) {
+        op.mode = (v <= BYTE_MAX) ? AM_ZEROPAGE : AM_ABSOLUTE;
+        op.value = v;
+    } else {
+        op.mode = AM_ABSOLUTE;
+        op.expr = strdup(s);
     }
 
     return op;
@@ -745,270 +775,6 @@ operand_t parse_operand(const char *s0)
  *  - Recognize directives vs. mnemonics
  *  - Parse operand (if any)
  */
-asm_line_t *parse_line(const char *in, int lineno)
-{
-    char tmp[MAX_LINE_LEN];
-
-    strncpy(tmp, in, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-    char *s = tmp;
-
-    /* Strip comments starting at ';', but ignore semicolons inside quotes */
-    {
-        int in_s = 0, in_d = 0;
-        for (char *p = s; *p; ++p) {
-            if (*p == '\'' && !in_d) {
-                in_s = !in_s;
-                continue;
-            }
-
-            if (*p == '"' && !in_s) {
-                in_d = !in_d;
-                continue;
-            }
-
-            if (!in_s && !in_d && *p == ';') {
-                *p = '\0';
-                break;
-            }
-        }
-    }
-
-    s = trimws(s);
-    if (*s == '\0') {
-        return NULL; /* blank or comment-only line */
-    }
-
-    asm_line_t *ln = calloc(1, sizeof(asm_line_t));
-    ln->lineno = lineno;
-    ln->filename = NULL;
-    ln->label = NULL;
-    ln->mnemonic = NULL;
-    ln->op.mode = AM_NONE;
-    ln->op.expr = NULL;
-    ln->extra = NULL;
-    ln->def_name = NULL;
-    ln->def_expr = NULL;
-
-    /* Label? Find a ':' that is outside quotes and precedes whitespace */
-    char *colon = NULL;
-    {
-        int in_s = 0, in_d = 0;
-        for (char *p = s; *p; ++p) {
-            if (*p == '\'' && !in_d) {
-                in_s = !in_s;
-                continue;
-            }
-
-            if (*p == '"' && !in_s) {
-                in_d = !in_d;
-                continue;
-            }
-
-            if (!in_s && !in_d && *p == ':') {
-                /* Verify the left side is a single identifier (no spaces) */
-                char leftbuf[STRING_BUF];
-                size_t leftlen = (size_t)(p - s);
-                if (leftlen >= sizeof(leftbuf)) {
-                    leftlen = sizeof(leftbuf) - 1;
-                }
-
-                memcpy(leftbuf, s, leftlen);
-                leftbuf[leftlen] = '\0';
-                char *lhs = trimws(leftbuf);
-                int ok = (*lhs != '\0');
-
-                for (char *q = lhs; ok && *q; ++q) {
-                    if (isspace((unsigned char)*q)) {
-                        ok = 0;
-                        break;
-                    }
-
-                    if (!(isalnum((unsigned char)*q) || *q == '_')) {
-                        ok = 0;
-                        break;
-                    }
-                }
-
-                if (ok) {
-                    colon = p;
-                }
-                break;
-            }
-        }
-    }
-
-    if (colon) {
-        *colon = '\0';
-        ln->label = strdup(trimws(s));
-        s = trimws(colon + 1);
-    }
-
-    if (*s == '\0') {
-        /* A pure label line like "start:" */
-        return ln;
-    }
-
-    /* Detect constant define: NAME = EXPR (excluding "* = expr" which is .org) */
-    do {
-        char *eq = strchr(s, '=');
-        if (!eq) {
-            break;
-        }
-
-        /* Split into lhs and rhs, without destroying original s further */
-        *eq = '\0';
-        char *lhs = trimws(s);
-        char *rhs = trimws(eq + 1);
-
-        /* If lhs is '*' this is the origin directive (supports "*=$c000") */
-        if (strcmp(lhs, "*") == 0) {
-            ln->mnemonic = strdup("*");
-            ln->extra = strdup(rhs);
-            return ln;
-        }
-
-        /* Ensure lhs looks like an identifier (letters/underscore/digits) */
-        int ok = (*lhs != '\0');
-        for (char *p = lhs; ok && *p; p++) {
-            if (!(isalnum((unsigned char)*p) || *p == '_' )) {
-                ok = 0;
-            }
-        }
-
-        /* Avoid confusing mnemonics/directives as define names */
-        if (ok &&
-                (is_mnemonic_name(lhs) ||
-                 strcasecmp(lhs, ".org") == 0 ||
-                 strcasecmp(lhs, ".byte") == 0 ||
-                 strcasecmp(lhs, ".word") == 0 ||
-                 strcasecmp(lhs, ".text") == 0 ||
-                 strcasecmp(lhs, ".incbin") == 0 ||
-                 strcasecmp(lhs, ".include") == 0))
-        {
-            ok = 0;
-        }
-
-        if (ok) {
-            ln->def_name = strdup(lhs);
-            ln->def_expr = strdup(rhs);
-            /* Mark mnemonic to a sentinel to identify this as a define in passes */
-            ln->mnemonic = strdup("=");
-            return ln;
-        }
-
-        /* Not a define; restore '=' and continue to normal parse */
-        *eq = '=';
-    } while (0);
-
-    /* Support label without colon if the entire line is a single token that is
-     * NOT a known mnemonic or directive. */
-    if (!colon) {
-        char *ws = s;
-        /* scan first token */
-        while (*ws && !isspace((unsigned char)*ws)) {
-            ws++;
-        }
-
-        /* Extract the first token without modifying the original buffer */
-        size_t tok_len = (size_t)(ws - s);
-        char first_tok[STRING_BUF];
-        if (tok_len >= sizeof(first_tok)) {
-            tok_len = sizeof(first_tok) - 1;
-        }
-        memcpy(first_tok, s, tok_len);
-        first_tok[tok_len] = '\0';
-
-        /* Compute the rest of the line after the token */
-        char *rest_after = (*ws) ? trimws(ws + 1) : ws; /* points to after token */
-        int is_single_token = (*rest_after == '\0');
-
-        int is_dir = (strcasecmp(first_tok, ".org") == 0) ||
-                     (strcasecmp(first_tok, ".byte") == 0) ||
-                     (strcasecmp(first_tok, ".word") == 0) ||
-                     (strcasecmp(first_tok, ".text") == 0) ||
-                     (strcasecmp(first_tok, ".incbin") == 0) ||
-                     (strcasecmp(first_tok, ".include") == 0) ||
-                     (strcmp(first_tok, "*") == 0);
-
-        int is_mn = is_mnemonic_name(first_tok);
-
-        if (!is_mn && !is_dir) {
-            ln->label = strdup(first_tok);
-            if (is_single_token) {
-                /* Pure label on its own line */
-                return ln;
-            }
-
-            /* Label followed by instruction/directive on the same line */
-            s = rest_after;
-        }
-    }
-
-    /* mnemonic / directive */
-    char *tok = strtok(s, " \t");
-    ln->mnemonic = strdup(tok);
-
-    char *rest = strtok(NULL, "");
-    if (rest) {
-        rest = trimws(rest);
-    }
-
-    /* directives */
-    if ((strcasecmp(ln->mnemonic, ".org") == 0) ||
-        (strcmp(ln->mnemonic, "*") == 0))
-    {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
-    }
-
-    if ((strcasecmp(ln->mnemonic, ".incbin") == 0)) {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
-    }
-
-    if ((strcasecmp(ln->mnemonic, ".include") == 0))
-    {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
-    }
-
-    if ((strcasecmp(ln->mnemonic, ".byte") == 0) ||
-        (strcasecmp(ln->mnemonic, ".word") == 0) ||
-        (strcasecmp(ln->mnemonic, ".text") == 0))
-    {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
-    }
-
-    /* else: instruction */
-    ln->op = parse_operand(rest);
-
-    /* If no operand provided, but the mnemonic supports accumulator addressing,
-     * default to AM_ACCUMULATOR to allow forms like "ASL"/"LSR"/"ROL"/"ROR". */
-    if ((!rest || *rest == '\0') && ln->op.mode == AM_NONE) {
-        const opcode_t *acc = opcode_lookup(ln->mnemonic, AM_ACCUMULATOR);
-        if (acc) {
-            ln->op.mode = AM_ACCUMULATOR;
-        }
-    }
-
-    /* Branch mnemonics always use relative addressing */
-    if (ln->mnemonic &&
-            (strcasecmp(ln->mnemonic, "bcc") == 0 ||
-             strcasecmp(ln->mnemonic, "bcs") == 0 ||
-             strcasecmp(ln->mnemonic, "beq") == 0 ||
-             strcasecmp(ln->mnemonic, "bmi") == 0 ||
-             strcasecmp(ln->mnemonic, "bne") == 0 ||
-             strcasecmp(ln->mnemonic, "bpl") == 0 ||
-             strcasecmp(ln->mnemonic, "bvc") == 0 ||
-             strcasecmp(ln->mnemonic, "bvs") == 0))
-    {
-        ln->op.mode = AM_RELATIVE;
-    }
-
-    return ln;
-}
 
 /* Symbol table lookup: return address for name, or -1 if not found. */
 int sym_lookup(const char *name)
@@ -1430,6 +1196,39 @@ static int is_define(const asm_line_t *ln)
     return (ln && ln->def_name != NULL && ln->def_expr != NULL);
 }
 
+static dir_kind_t classify_directive(const asm_line_t *ln)
+{
+    if (!ln || !ln->mnemonic) {
+        return DIR_NONE;
+    }
+
+    if (is_define(ln)) {
+        return DIR_DEFINE;
+    }
+
+    if (is_org(ln)) {
+        return DIR_ORG;
+    }
+
+    if (is_incbin(ln)) {
+        return DIR_INCBIN;
+    }
+
+    if (is_byte_dir(ln)) {
+        return DIR_BYTE;
+    }
+
+    if (is_word_dir(ln)) {
+        return DIR_WORD;
+    }
+
+    if (is_text_dir(ln)) {
+        return DIR_TEXT;
+    }
+
+    return DIR_NONE;
+}
+
 static int parse_org_value_file(const char *file, const char *extra, int lineno, int pc)
 {
     if (!extra) {
@@ -1541,7 +1340,9 @@ static void first_handle_word(const asm_line_t *ln, int *pc)
     *pc += 2 * count_csv_items(ln->extra);
 }
 
-static void first_handle_text(const asm_line_t *ln, int *pc)
+/* Extracts the payload of a .text directive as a newly allocated C string.
+ * Caller must free the returned pointer. */
+static char *extract_text_payload_alloc(const asm_line_t *ln)
 {
     if (!ln->extra) {
         asm_error_file(ln->filename, ln->lineno, "Missing string in .text");
@@ -1557,6 +1358,7 @@ static void first_handle_text(const asm_line_t *ln, int *pc)
     }
 
     char quote = *t++;
+
     char *end = strrchr(t, quote);
     if (!end) {
         asm_error_file(ln->filename, ln->lineno, "Unterminated string in .text");
@@ -1564,7 +1366,14 @@ static void first_handle_text(const asm_line_t *ln, int *pc)
 
     *end = '\0';
 
-    *pc += (int)strlen(t);
+    return strdup(t);
+}
+
+static void first_handle_text(const asm_line_t *ln, int *pc)
+{
+    char *text = extract_text_payload_alloc(ln);
+    *pc += (int)strlen(text);
+    free(text);
 }
 
 static void first_handle_instruction(const asm_line_t *ln, int *pc)
@@ -1675,37 +1484,35 @@ void first_pass(void)
             continue;
         }
 
-        if (is_define(ln)) {
-            first_handle_define(ln, &pc);
-            continue;
-        }
+        switch (classify_directive(ln)) {
+            case DIR_DEFINE:
+                first_handle_define(ln, &pc);
+                break;
 
-        if (is_org(ln)) {
-            first_handle_org(ln, &pc);
-            continue;
-        }
+            case DIR_ORG:
+                first_handle_org(ln, &pc);
+                break;
 
-        if (is_incbin(ln)) {
-            first_handle_incbin(ln, &pc);
-            continue;
-        }
+            case DIR_INCBIN:
+                first_handle_incbin(ln, &pc);
+                break;
 
-        if (is_byte_dir(ln)) {
-            first_handle_byte(ln, &pc);
-            continue;
-        }
+            case DIR_BYTE:
+                first_handle_byte(ln, &pc);
+                break;
 
-        if (is_word_dir(ln)) {
-            first_handle_word(ln, &pc);
-            continue;
-        }
+            case DIR_WORD:
+                first_handle_word(ln, &pc);
+                break;
 
-        if (is_text_dir(ln)) {
-            first_handle_text(ln, &pc);
-            continue;
-        }
+            case DIR_TEXT:
+                first_handle_text(ln, &pc);
+                break;
 
-        first_handle_instruction(ln, &pc);
+            case DIR_NONE:
+                first_handle_instruction(ln, &pc);
+                break;
+        }
     }
 }
 
@@ -1736,6 +1543,59 @@ void emit_word(int pc, int v)
     emit_byte(pc + 1, HIBYTE(v));
 }
 
+/* ---- Helpers to flatten second pass emission ---- */
+static int resolve_value_from_expr(const char *expr,
+                                   int pc,
+                                   int line_index,
+                                   const char *file,
+                                   int lineno,
+                                   int *out)
+{
+    char kind; int n;
+    if (parse_local_ref(expr, &kind, &n)) {
+        int addr;
+        if (kind == '-') {
+            if (!resolve_minus_addr_k(line_index, n, &addr)) {
+                asm_error_file(file, lineno, "No matching '-' label found");
+            }
+        } else {
+            if (!resolve_plus_addr_k(line_index, n, &addr)) {
+                asm_error_file(file, lineno, "No matching '+' label found");
+            }
+        }
+        *out = addr;
+        return 1;
+    }
+
+    g_eval_pc = pc;
+    if (eval_expr(expr, out) || parse_number(expr, out)) {
+        return 1;
+    }
+
+    int s = sym_lookup(expr);
+    if (s < 0) {
+        asm_error_file(file, lineno, "Undefined label %s", expr);
+    }
+
+    *out = s;
+
+    return 1;
+}
+
+static int resolve_operand_value_for_line(const asm_line_t *ln,
+                                          int pc,
+                                          int line_index,
+                                          int *out)
+{
+    if (ln->op.expr) {
+        return resolve_value_from_expr(ln->op.expr, pc, line_index, ln->filename, ln->lineno, out);
+    }
+
+    *out = ln->op.value;
+
+    return 1;
+}
+
 static void second_handle_org(const asm_line_t *ln, int *pc)
 {
     *pc = parse_org_value(ln->extra, ln->lineno, *pc);
@@ -1753,6 +1613,7 @@ static void second_handle_incbin(const asm_line_t *ln, int *pc)
     char *fn = trimws(fnbuf);
     if (*fn == '"' || *fn == '\'') {
         fn++;
+
         char *qe = strrchr(fn, fn[-1]);
         if (qe) {
             *qe = '\0';
@@ -1784,39 +1645,16 @@ static void second_handle_byte(const asm_line_t *ln, int *pc)
     while (tok) {
         char *t = trimws(tok);
         int v;
-        g_eval_pc = *pc;
 
-        char kind; int n;
-        if (parse_local_ref(t, &kind, &n)) {
-            if (kind == '-') {
-                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found in .byte");
-                }
-            } else {
-                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found in .byte");
-                }
-            }
-        } else if (parse_number(t, &v) || eval_expr(t, &v)) {
-            if (v < 0 || v > BYTE_MAX) {
-                asm_error_file(ln->filename, ln->lineno, ".byte value %d out of 8-bit range", v);
-            }
-
-            emit_byte(*pc, (uint8_t)v);
-        } else {
-            int s = sym_lookup(t);
-            if (s < 0) {
-                asm_error_file(ln->filename, ln->lineno, "Undefined symbol %s in .byte", t);
-            }
-
-            if (s < 0 || s > BYTE_MAX) {
-                asm_error_file(ln->filename, ln->lineno, ".byte symbol %s = %d out of 8-bit range",
-                        t, s);
-            }
-
-            emit_byte(*pc, (uint8_t)s);
+        if (!resolve_value_from_expr(t, *pc, current_line_index, ln->filename, ln->lineno, &v)) {
+            asm_error_file(ln->filename, ln->lineno, "Failed to resolve .byte value");
         }
 
+        if (v < 0 || v > BYTE_MAX) {
+            asm_error_file(ln->filename, ln->lineno, ".byte value %d out of 8-bit range", v);
+        }
+
+        emit_byte(*pc, (uint8_t)v);
         (*pc)++;
         tok = strtok(NULL, ",");
     }
@@ -1832,39 +1670,16 @@ static void second_handle_word(const asm_line_t *ln, int *pc)
     while (tok) {
         char *t = trimws(tok);
         int v;
-        g_eval_pc = *pc;
 
-        char kind; int n;
-        if (parse_local_ref(t, &kind, &n)) {
-            if (kind == '-') {
-                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found in .word");
-                }
-            } else {
-                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found in .word");
-                }
-            }
-        } else if (parse_number(t, &v) || eval_expr(t, &v)) {
-            if (v < 0 || v > WORD_MAX) {
-                asm_error_file(ln->filename, ln->lineno, ".word value %d out of 16-bit range", v);
-            }
-
-            emit_word(*pc, v);
-        } else {
-            int s = sym_lookup(t);
-            if (s < 0) {
-                asm_error_file(ln->filename, ln->lineno, "Undefined symbol %s in .word", t);
-            }
-
-            if (s < 0 || s > WORD_MAX) {
-                asm_error_file(ln->filename, ln->lineno,
-                        ".word symbol %s = %d out of 16-bit range", t, s);
-            }
-
-            emit_word(*pc, s);
+        if (!resolve_value_from_expr(t, *pc, current_line_index, ln->filename, ln->lineno, &v)) {
+            asm_error_file(ln->filename, ln->lineno, "Failed to resolve .word value");
         }
 
+        if (v < 0 || v > WORD_MAX) {
+            asm_error_file(ln->filename, ln->lineno, ".word value %d out of 16-bit range", v);
+        }
+
+        emit_word(*pc, v);
         (*pc) += 2;
         tok = strtok(NULL, ",");
     }
@@ -1874,26 +1689,14 @@ static void second_handle_word(const asm_line_t *ln, int *pc)
 
 static void second_handle_text(const asm_line_t *ln, int *pc)
 {
-    char buf[STRING_BUF];
-    strncpy(buf, ln->extra ? ln->extra : "", sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char *text = extract_text_payload_alloc(ln);
 
-    char *t = trimws(buf);
-    if (*t != '"' && *t != '\'') {
-        asm_error_file(ln->filename, ln->lineno, "Expected quoted string for .text");
-    }
-
-    char quote = *t++;
-    char *end = strrchr(t, quote);
-    if (!end) {
-        asm_error_file(ln->filename, ln->lineno, "Unterminated string in .text");
-    }
-    *end = '\0';
-
-    for (char *p = t; *p; ++p) {
+    for (char *p = text; *p; ++p) {
         emit_byte(*pc, (uint8_t)(unsigned char)(*p));
         (*pc)++;
     }
+
+    free(text);
 }
 
 static void second_emit_instruction(const asm_line_t *ln, int *pc)
@@ -1903,11 +1706,13 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
     /* Fallback: if ZEROPAGE,Y isn't supported for this mnemonic, try ABSOLUTE,Y. */
     if (!op && ln->op.mode == AM_ZEROPAGE_Y) {
         const opcode_t *alt = opcode_lookup(ln->mnemonic, AM_ABSOLUTE_Y);
+
         if (alt) {
             ((asm_line_t *)ln)->op.mode = AM_ABSOLUTE_Y;
             op = alt;
         }
     }
+
     if (!op) {
         asm_error_file(ln->filename, ln->lineno, "%s does not support %s addressing",
                 ln->mnemonic, addrmode_str(ln->op.mode));
@@ -1921,131 +1726,53 @@ static void second_emit_instruction(const asm_line_t *ln, int *pc)
             break;
 
         case 2: {
-                    int v;
-                    if (ln->op.mode == AM_RELATIVE) {
-                        int target;
+            int v;
 
-                        if (ln->op.expr) {
-                            /* Handle local temporary labels: '-', '--', and '+', '++' */
-                            char kind; int n;
-                            if (parse_local_ref(ln->op.expr, &kind, &n)) {
-                                if (kind == '-') {
-                                    if (!resolve_minus_addr_k(current_line_index, n, &target)) {
-                                        asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
-                                    }
-                                } else {
-                                    if (!resolve_plus_addr_k(current_line_index, n, &target)) {
-                                        asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
-                                    }
-                                }
-                            } else {
-                                int tmp;
-                                g_eval_pc = *pc;
-
-                                if (eval_expr(ln->op.expr, &tmp) || parse_number(ln->op.expr, &tmp)) {
-                                    target = tmp;
-                                } else {
-                                    target = sym_lookup(ln->op.expr);
-                                    if (target < 0) {
-                                        asm_error_file(ln->filename, ln->lineno, "Undefined label %s for branch",
-                                            ln->op.expr);
-                                    }
-                                }
-                            }
-                        } else {
-                            v = ln->op.value;
-                            target = v;
-                        }
-
-                        int offset = target - (*pc + 2);
-                        if (offset < BRANCH_MIN || offset > BRANCH_MAX) {
-                            asm_error_file(ln->filename, ln->lineno, "Branch offset out of range: %d", offset);
-                        }
-
-                        emit_byte(*pc + 1, (uint8_t)offset);
-                    } else {
-                        if (ln->op.expr) {
-                            g_eval_pc = *pc;
-
-                            char kind; int n;
-                            if (parse_local_ref(ln->op.expr, &kind, &n)) {
-                                if (kind == '-') {
-                                    if (!resolve_minus_addr_k(current_line_index, n, &v)) {
-                                        asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
-                                    }
-                                } else {
-                                    if (!resolve_plus_addr_k(current_line_index, n, &v)) {
-                                        asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
-                                    }
-                                }
-                            } else if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
-                                /* ok */
-                            } else {
-                                int s = sym_lookup(ln->op.expr);
-                                if (s < 0) {
-                                    asm_error_file(ln->filename, ln->lineno, "Undefined label %s",
-                                            ln->op.expr);
-                                }
-
-                                v = s;
-                            }
-                        } else {
-                            v = ln->op.value;
-                        }
-
-                        if (v < 0 || v > BYTE_MAX) {
-                            asm_error_file(ln->filename, ln->lineno, "8-bit operand %d out of range", v);
-                        }
-
-                        emit_byte(*pc + 1, LOBYTE(v));
-                    }
-
-                    (*pc) += 2;
-                    break;
+            if (ln->op.mode == AM_RELATIVE) {
+                if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "Failed to resolve branch target");
                 }
+
+                int offset = v - (*pc + 2);
+                if (offset < BRANCH_MIN || offset > BRANCH_MAX) {
+                    asm_error_file(ln->filename, ln->lineno, "Branch offset out of range: %d", offset);
+                }
+
+                emit_byte(*pc + 1, (uint8_t)offset);
+            } else {
+                if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
+                    asm_error_file(ln->filename, ln->lineno, "Failed to resolve operand");
+                }
+
+                if (v < 0 || v > BYTE_MAX) {
+                    asm_error_file(ln->filename, ln->lineno, "8-bit operand %d out of range", v);
+                }
+
+                emit_byte(*pc + 1, LOBYTE(v));
+            }
+
+            (*pc) += 2;
+            break;
+        }
 
         case 3: {
-                    int v;
+            int v;
 
-                    if (ln->op.expr) {
-                        g_eval_pc = *pc;
+            if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
+                asm_error_file(ln->filename, ln->lineno, "Failed to resolve operand");
+            }
 
-                        char kind; int n;
-                        if (parse_local_ref(ln->op.expr, &kind, &n)) {
-                            if (kind == '-') {
-                                if (!resolve_minus_addr_k(current_line_index, n, &v)) {
-                                    asm_error_file(ln->filename, ln->lineno, "No matching '-' label found");
-                                }
-                            } else {
-                                if (!resolve_plus_addr_k(current_line_index, n, &v)) {
-                                    asm_error_file(ln->filename, ln->lineno, "No matching '+' label found");
-                                }
-                            }
-                        } else if (eval_expr(ln->op.expr, &v) || parse_number(ln->op.expr, &v)) {
-                            /* ok */
-                        } else {
-                            int s = sym_lookup(ln->op.expr);
-                            if (s < 0) {
-                                asm_error_file(ln->filename, ln->lineno, "Undefined label %s", ln->op.expr);
-                            }
-                            v = s;
-                        }
-                    } else {
-                        v = ln->op.value;
-                    }
+            if (v < 0 || v > WORD_MAX) {
+                asm_error_file(ln->filename, ln->lineno, "16-bit operand %d out of range", v);
+            }
 
-                    if (v < 0 || v > WORD_MAX) {
-                        asm_error_file(ln->filename, ln->lineno, "16-bit operand %d out of range", v);
-                    }
-
-                    emit_word(*pc + 1, v);
-                    (*pc) += 3;
-
-                    break;
-                }
+            emit_word(*pc + 1, v);
+            (*pc) += 3;
+            break;
+        }
 
         default:
-                asm_error_file(ln->filename, ln->lineno, "Invalid opcode length %d", op->length);
+            asm_error_file(ln->filename, ln->lineno, "Invalid opcode length %d", op->length);
     }
 }
 
@@ -2064,38 +1791,330 @@ void second_pass(void)
             continue;
         }
 
-        if (is_define(ln)) {
-            /* Defines do not emit bytes or change PC in pass 2 */
-            continue;
-        }
+        switch (classify_directive(ln)) {
+            case DIR_DEFINE:
+                /* no-op in second pass */
+                break;
 
-        if (is_org(ln)) {
-            second_handle_org(ln, &pc);
-            continue;
-        }
+            case DIR_ORG:
+                second_handle_org(ln, &pc);
+                break;
 
-        if (is_incbin(ln)) {
-            second_handle_incbin(ln, &pc);
-            continue;
-        }
+            case DIR_INCBIN:
+                second_handle_incbin(ln, &pc);
+                break;
 
-        if (is_byte_dir(ln)) {
-            second_handle_byte(ln, &pc);
-            continue;
-        }
+            case DIR_BYTE:
+                second_handle_byte(ln, &pc);
+                break;
 
-        if (is_word_dir(ln)) {
-            second_handle_word(ln, &pc);
-            continue;
-        }
+            case DIR_WORD:
+                second_handle_word(ln, &pc);
+                break;
 
-        if (is_text_dir(ln)) {
-            second_handle_text(ln, &pc);
-            continue;
-        }
+            case DIR_TEXT:
+                second_handle_text(ln, &pc);
+                break;
 
-        second_emit_instruction(ln, &pc);
+            case DIR_NONE:
+                second_emit_instruction(ln, &pc);
+                break;
+        }
     }
+}
+
+/* ---------------- Source parsing ---------------- */
+
+/* Helpers to parse one source line into asm_line_t */
+static void strip_comments_preserving_quotes(char *s)
+{
+    int in_s = 0;
+    int in_d = 0;
+
+    for (char *p = s; *p; ++p) {
+        if (*p == '\'' && !in_d) {
+            in_s = !in_s;
+            continue;
+        }
+
+        if (*p == '"' && !in_s) {
+            in_d = !in_d;
+            continue;
+        }
+
+        if (!in_s && !in_d && *p == ';') {
+            *p = '\0';
+            break;
+        }
+    }
+}
+
+static int label_lhs_is_identifier(const char *s, size_t len)
+{
+    char leftbuf[STRING_BUF];
+
+    if (len >= sizeof(leftbuf)) {
+        len = sizeof(leftbuf) - 1;
+    }
+
+    memcpy(leftbuf, s, len); leftbuf[len] = '\0';
+
+    char *lhs = trimws(leftbuf);
+    if (*lhs == '\0') {
+        return 0;
+    }
+
+    for (char *q = lhs; *q; ++q) {
+        if (isspace((unsigned char)*q)) {
+            return 0;
+        }
+
+        if (!(isalnum((unsigned char)*q) || *q == '_')) {
+            return 0;
+        }
+
+    }
+
+    return 1;
+}
+
+static char *find_valid_label_colon(char *s)
+{
+    int in_s = 0;
+    int in_d = 0;
+
+    for (char *p = s; *p; ++p) {
+        if (*p == '\'' && !in_d) {
+            in_s = !in_s;
+            continue;
+        }
+
+        if (*p == '"' && !in_s) {
+            in_d = !in_d;
+            continue;
+        }
+
+        if (!in_s && !in_d && *p == ':') {
+            if (label_lhs_is_identifier(s, (size_t)(p - s))) {
+                return p;
+            }
+
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+static int is_directive_name(const char *t)
+{
+    return (strcasecmp(t, ".org") == 0) ||
+           (strcasecmp(t, ".byte") == 0) ||
+           (strcasecmp(t, ".word") == 0) ||
+           (strcasecmp(t, ".text") == 0) ||
+           (strcasecmp(t, ".incbin") == 0) ||
+           (strcasecmp(t, ".include") == 0) ||
+           (strcmp(t, "*") == 0);
+}
+
+static int try_parse_define_line(char *s, asm_line_t *ln)
+{
+    char *eq = strchr(s, '=');
+    if (!eq) {
+        return 0;
+    }
+
+    *eq = '\0';
+    char *lhs = trimws(s);
+    char *rhs = trimws(eq + 1);
+
+    if (strcmp(lhs, "*") == 0) {
+        ln->mnemonic = strdup("*");
+        ln->extra = strdup(rhs);
+        return 1;
+    }
+
+    int ok = (*lhs != '\0');
+
+    for (char *p = lhs; ok && *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_' )) {
+            ok = 0;
+        }
+    }
+
+    if (ok && (is_mnemonic_name(lhs) || is_directive_name(lhs))) {
+        ok = 0;
+    }
+
+    if (ok) {
+        ln->def_name = strdup(lhs);
+        ln->def_expr = strdup(rhs);
+        ln->mnemonic = strdup("=");
+        return 1;
+    }
+
+    /* not a define: restore '=' and signal no-define */
+    *eq = '=';
+    return 0;
+}
+
+static int maybe_parse_bare_label(char **ps, asm_line_t *ln, int had_colon)
+{
+    if (had_colon) {
+        return 0;
+    }
+
+    char *s = *ps;
+    char *ws = s;
+
+    while (*ws && !isspace((unsigned char)*ws)) {
+        ws++;
+    }
+
+    size_t tok_len = (size_t)(ws - s);
+    char first_tok[STRING_BUF];
+
+    if (tok_len >= sizeof(first_tok)) {
+        tok_len = sizeof(first_tok) - 1;
+    }
+
+    memcpy(first_tok, s, tok_len); first_tok[tok_len] = '\0';
+
+    char *rest_after = (*ws) ? trimws(ws + 1) : ws;
+
+    int is_single_token = (*rest_after == '\0');
+    int is_dir = is_directive_name(first_tok);
+    int is_mn = is_mnemonic_name(first_tok);
+
+    if (!is_mn && !is_dir) {
+        ln->label = strdup(first_tok);
+
+        if (is_single_token) {
+            *ps = s + strlen(s);
+            return 1;
+        }
+
+        *ps = rest_after;
+    }
+
+    return 0;
+}
+
+asm_line_t *parse_line(const char *in, int lineno)
+{
+    char tmp[MAX_LINE_LEN];
+
+    strncpy(tmp, in, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    char *s = tmp;
+
+    /* Strip comments starting at ';', but ignore semicolons inside quotes */
+    strip_comments_preserving_quotes(s);
+
+    s = trimws(s);
+    if (*s == '\0') {
+        return NULL; /* blank or comment-only line */
+    }
+
+    asm_line_t *ln = calloc(1, sizeof(asm_line_t));
+    ln->lineno = lineno;
+    ln->filename = NULL;
+    ln->label = NULL;
+    ln->mnemonic = NULL;
+    ln->op.mode = AM_NONE;
+    ln->op.expr = NULL;
+    ln->extra = NULL;
+    ln->def_name = NULL;
+    ln->def_expr = NULL;
+
+    /* Label? Find a ':' that is outside quotes and precedes whitespace */
+    char *colon = find_valid_label_colon(s);
+
+    if (colon) {
+        *colon = '\0';
+        ln->label = strdup(trimws(s));
+        s = trimws(colon + 1);
+    }
+
+    if (*s == '\0') {
+        /* A pure label line like "start:" */
+        return ln;
+    }
+
+    /* Detect constant define: NAME = EXPR (excluding "* = expr" which is .org) */
+    if (try_parse_define_line(s, ln)) {
+        return ln;
+    }
+
+    /* Support label without colon if the entire line is a single token that is
+     * NOT a known mnemonic or directive. */
+    if (!colon) {
+        if (maybe_parse_bare_label(&s, ln, 0)) return ln; /* pure label */
+    }
+
+    /* mnemonic / directive */
+    char *tok = strtok(s, " \t");
+    ln->mnemonic = strdup(tok);
+
+    char *rest = strtok(NULL, "");
+    if (rest) {
+        rest = trimws(rest);
+    }
+
+    /* directives */
+    if ((strcasecmp(ln->mnemonic, ".org") == 0) ||
+        (strcmp(ln->mnemonic, "*") == 0))
+    {
+        ln->extra = rest ? strdup(rest) : NULL;
+        return ln;
+    }
+
+    if ((strcasecmp(ln->mnemonic, ".incbin") == 0)) {
+        ln->extra = rest ? strdup(rest) : NULL;
+        return ln;
+    }
+
+    if ((strcasecmp(ln->mnemonic, ".include") == 0))
+    {
+        ln->extra = rest ? strdup(rest) : NULL;
+        return ln;
+    }
+
+    if ((strcasecmp(ln->mnemonic, ".byte") == 0) ||
+        (strcasecmp(ln->mnemonic, ".word") == 0) ||
+        (strcasecmp(ln->mnemonic, ".text") == 0))
+    {
+        ln->extra = rest ? strdup(rest) : NULL;
+        return ln;
+    }
+
+    /* else: instruction */
+    ln->op = parse_operand(rest);
+
+    /* If no operand provided, but the mnemonic supports accumulator addressing,
+     * default to AM_ACCUMULATOR to allow forms like "ASL"/"LSR"/"ROL"/"ROR". */
+    if ((!rest || *rest == '\0') && ln->op.mode == AM_NONE) {
+        const opcode_t *acc = opcode_lookup(ln->mnemonic, AM_ACCUMULATOR);
+        if (acc) {
+            ln->op.mode = AM_ACCUMULATOR;
+        }
+    }
+
+    /* Branch mnemonics always use relative addressing */
+    if (ln->mnemonic &&
+            (strcasecmp(ln->mnemonic, "bcc") == 0 ||
+             strcasecmp(ln->mnemonic, "bcs") == 0 ||
+             strcasecmp(ln->mnemonic, "beq") == 0 ||
+             strcasecmp(ln->mnemonic, "bmi") == 0 ||
+             strcasecmp(ln->mnemonic, "bne") == 0 ||
+             strcasecmp(ln->mnemonic, "bpl") == 0 ||
+             strcasecmp(ln->mnemonic, "bvc") == 0 ||
+             strcasecmp(ln->mnemonic, "bvs") == 0))
+    {
+        ln->op.mode = AM_RELATIVE;
+    }
+
+    return ln;
 }
 
 /* ---------------- Include expansion loader ---------------- */
