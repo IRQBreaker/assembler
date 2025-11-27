@@ -695,7 +695,6 @@ static int macro_parse_header(const char *line, char *name_out, char argnames[][
 
     /* args until ')' */
     int argc = 0;
-
     while (1) {
         s = trimws(s);
 
@@ -787,7 +786,9 @@ static int macro_try_define(FILE *fin, const char *path, const char *header_line
         }
 
         char tmp[MAX_LINE_LEN];
-        strncpy(tmp, linebuf, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+        strncpy(tmp, linebuf, sizeof(tmp)-1);
+        tmp[sizeof(tmp)-1] = '\0';
+
         char *t = trimws(tmp);
 
         /* strip comments for control tokens but keep original in body */
@@ -850,7 +851,7 @@ static char *replace_ident_tokens(const char *in, const char **tokens, const cha
                     size_t rl = strlen(r);
 
                     if (len + rl + 1 > cap) {
-                        cap = (len + rl + 64)*2;
+                        cap = (len + rl + 64) * 2;
                         out = realloc(out, cap);
                     }
 
@@ -865,7 +866,7 @@ static char *replace_ident_tokens(const char *in, const char **tokens, const cha
 
             if (!replaced) {
                 if (len + (size_t)ilen + 1 > cap) {
-                    cap = (len + ilen + 64)*2;
+                    cap = (len + ilen + 64) * 2;
                     out = realloc(out, cap);
                 }
 
@@ -880,7 +881,7 @@ static char *replace_ident_tokens(const char *in, const char **tokens, const cha
 
         /* copy single char */
         if (len + 2 > cap) {
-            cap = (len + 64)*2;
+            cap = (len + 64) * 2;
             out = realloc(out, cap);
         }
 
@@ -953,6 +954,7 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
                 /* end of args */
                 token[tlen] = '\0';
                 char *trimmed = trimws(token);
+
                 /* If there is nothing between parentheses, treat as zero args. */
                 if (!(ac == 0 && *trimmed == '\0')) {
                     char *v = strdup(trimmed);
@@ -960,8 +962,10 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
                         argstore[ac] = v;
                         argvals[ac] = v;
                     }
+
                     ac++;
                 }
+
                 break;
             } else {
                 depth--;
@@ -970,6 +974,7 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
         } else if (c == ',' && depth == 0) {
             token[tlen] = '\0';
             char *trimmed = trimws(token);
+
             /* Ignore empty tokens between commas (e.g., stray commas). */
             if (*trimmed != '\0') {
                 char *v = strdup(trimmed);
@@ -977,8 +982,10 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
                     argstore[ac] = v;
                     argvals[ac] = v;
                 }
+
                 ac++;
             }
+
             tlen = 0;
             token[0] = '\0';
         } else {
@@ -2915,7 +2922,10 @@ static void read_file_with_includes(const char *path)
     while (fgets(linebuf, sizeof(linebuf), fin)) {
         lineno++;
         /* remove trailing newline */
-        size_t L = strlen(linebuf); if (L && (linebuf[L-1] == '\n' || linebuf[L-1] == '\r')) linebuf[L-1] = '\0';
+        size_t L = strlen(linebuf);
+        if (L && (linebuf[L-1] == '\n' || linebuf[L-1] == '\r')) {
+            linebuf[L-1] = '\0';
+        }
 
         /* Macro definition? If so, it consumes its block and does not emit a line. */
         if (macro_try_define(fin, path, linebuf, &lineno)) {
