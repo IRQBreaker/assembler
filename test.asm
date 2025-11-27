@@ -344,3 +344,10 @@ ClearScreen($4400,$20)
     PushRegs()
     PopRegs()
     rts
+
+; FILL
+.org $3800
+
+.fill 256, 1
+
+foobar .fill 256, 2

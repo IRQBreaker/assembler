@@ -104,7 +104,8 @@ typedef enum dir_kind
     DIR_INCBIN,
     DIR_BYTE,
     DIR_WORD,
-    DIR_TEXT
+    DIR_TEXT,
+    DIR_FILL
 } dir_kind_t;
 
 /* Globals */
@@ -1745,6 +1746,11 @@ static int is_text_dir(const asm_line_t *ln)
     return (ln->mnemonic && (strcasecmp(ln->mnemonic, ".text") == 0));
 }
 
+static int is_fill_dir(const asm_line_t *ln)
+{
+    return (ln->mnemonic && (strcasecmp(ln->mnemonic, ".fill") == 0));
+}
+
 static int is_define(const asm_line_t *ln)
 {
     return (ln && ln->def_name != NULL && ln->def_expr != NULL);
@@ -1778,6 +1784,10 @@ static dir_kind_t classify_directive(const asm_line_t *ln)
 
     if (is_text_dir(ln)) {
         return DIR_TEXT;
+    }
+
+    if (is_fill_dir(ln)) {
+        return DIR_FILL;
     }
 
     return DIR_NONE;
@@ -1904,6 +1914,43 @@ static void first_handle_word(const asm_line_t *ln, int *pc)
     }
 
     *pc += 2 * count_csv_items(ln->extra);
+}
+
+/* .fill <size>, <value> : advance PC by <size> in first pass */
+static void first_handle_fill(const asm_line_t *ln, int *pc)
+{
+    if (!ln->extra) {
+        asm_error_file(ln->filename, ln->lineno, "Missing arguments for .fill (expected: size, value)");
+    }
+
+    char buf[MAX_LINE_LEN];
+    strncpy(buf, ln->extra, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *comma = strchr(buf, ',');
+    if (!comma) {
+        asm_error_file(ln->filename, ln->lineno, "Malformed .fill, expected: .fill <size>, <value>");
+    }
+
+    *comma = '\0';
+    char *size_tok = trimws(buf);
+    int size_val;
+
+    g_eval_pc = *pc;
+    if (!(parse_number(size_tok, &size_val) || eval_expr(size_tok, &size_val))) {
+        /* try symbol lookup of bare name */
+        int s = sym_lookup(size_tok);
+        if (s < 0) {
+            asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill size: %s", ln->extra);
+        }
+        size_val = s;
+    }
+
+    if (size_val < 0) {
+        asm_error_file(ln->filename, ln->lineno, ".fill size must be non-negative: %d", size_val);
+    }
+
+    *pc += size_val;
 }
 
 /* Extracts the payload of a .text directive as a newly allocated C string.
@@ -2073,6 +2120,10 @@ void first_pass(void)
 
             case DIR_TEXT:
                 first_handle_text(ln, &pc);
+                break;
+
+            case DIR_FILL:
+                first_handle_fill(ln, &pc);
                 break;
 
             case DIR_NONE:
@@ -2270,6 +2321,56 @@ static void second_handle_text(const asm_line_t *ln, int *pc)
     free(text);
 }
 
+/* .fill <size>, <value> : emit <size> bytes of <value> */
+static void second_handle_fill(const asm_line_t *ln, int *pc)
+{
+    if (!ln->extra) {
+        asm_error_file(ln->filename, ln->lineno, "Missing arguments for .fill (expected: size, value)");
+    }
+
+    char buf[MAX_LINE_LEN];
+    strncpy(buf, ln->extra, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *comma = strchr(buf, ',');
+    if (!comma) {
+        asm_error_file(ln->filename, ln->lineno, "Malformed .fill, expected: .fill <size>, <value>");
+    }
+
+    *comma = '\0';
+    char *size_tok = trimws(buf);
+    char *val_tok = trimws(comma + 1);
+
+    int size_val;
+    int value;
+
+    /* Resolve size via expression parser; require non-negative */
+    g_eval_pc = *pc;
+    if (!(parse_number(size_tok, &size_val) || eval_expr(size_tok, &size_val))) {
+        if (!resolve_value_from_expr(size_tok, *pc, current_line_index, ln->filename, ln->lineno, &size_val)) {
+            asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill size: %s", ln->extra);
+        }
+    }
+
+    if (size_val < 0) {
+        asm_error_file(ln->filename, ln->lineno, ".fill size must be non-negative: %d", size_val);
+    }
+
+    /* Resolve fill byte value */
+    if (!resolve_value_from_expr(val_tok, *pc, current_line_index, ln->filename, ln->lineno, &value)) {
+        asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill value: %s", ln->extra);
+    }
+
+    if (value < 0 || value > BYTE_MAX) {
+        asm_error_file(ln->filename, ln->lineno, ".fill value %d out of 8-bit range", value);
+    }
+
+    for (int i = 0; i < size_val; ++i) {
+        emit_byte(*pc, (uint8_t)value);
+        (*pc)++;
+    }
+}
+
 static void second_emit_instruction(const asm_line_t *ln, int *pc)
 {
     const opcode_t *op = opcode_lookup(ln->mnemonic, ln->op.mode);
@@ -2390,6 +2491,10 @@ void second_pass(void)
             case DIR_NONE:
                 second_emit_instruction(ln, &pc);
                 break;
+
+            case DIR_FILL:
+                second_handle_fill(ln, &pc);
+                break;
         }
     }
 }
@@ -2483,6 +2588,7 @@ static int is_directive_name(const char *t)
            (strcasecmp(t, ".byte") == 0) ||
            (strcasecmp(t, ".word") == 0) ||
            (strcasecmp(t, ".text") == 0) ||
+           (strcasecmp(t, ".fill") == 0) ||
            (strcasecmp(t, ".incbin") == 0) ||
            (strcasecmp(t, ".include") == 0) ||
            (strcasecmp(t, ".macro") == 0) ||
@@ -2657,7 +2763,8 @@ asm_line_t *parse_line(const char *in, int lineno)
 
     if ((strcasecmp(ln->mnemonic, ".byte") == 0) ||
         (strcasecmp(ln->mnemonic, ".word") == 0) ||
-        (strcasecmp(ln->mnemonic, ".text") == 0))
+        (strcasecmp(ln->mnemonic, ".text") == 0) ||
+        (strcasecmp(ln->mnemonic, ".fill") == 0))
     {
         ln->extra = rest ? strdup(rest) : NULL;
         return ln;
