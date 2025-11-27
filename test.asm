@@ -324,3 +324,23 @@ ClearScreen($4400,$20)
 
     lda #$10
     AddImm(5)        ; becomes: clc / adc #5
+
+.macro PushRegs() {
+    pha
+    txa
+    pha
+    tya
+    pha
+}
+
+.macro PopRegs() {
+    pla
+    tay
+    pla
+    tax
+    pla
+}
+
+    PushRegs()
+    PopRegs()
+    rts

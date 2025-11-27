@@ -951,14 +951,16 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
             if (depth == 0) {
                 /* end of args */
                 token[tlen] = '\0';
-                char *v = strdup(trimws(token));
-
-                if (ac < MAX_MACRO_ARGS) {
-                    argstore[ac] = v;
-                    argvals[ac] = v;
+                char *trimmed = trimws(token);
+                /* If there is nothing between parentheses, treat as zero args. */
+                if (!(ac == 0 && *trimmed == '\0')) {
+                    char *v = strdup(trimmed);
+                    if (ac < MAX_MACRO_ARGS) {
+                        argstore[ac] = v;
+                        argvals[ac] = v;
+                    }
+                    ac++;
                 }
-
-                ac++;
                 break;
             } else {
                 depth--;
@@ -966,15 +968,16 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
             }
         } else if (c == ',' && depth == 0) {
             token[tlen] = '\0';
-
-            char *v = strdup(trimws(token));
-
-            if (ac < MAX_MACRO_ARGS) {
-                argstore[ac] = v;
-                argvals[ac] = v;
+            char *trimmed = trimws(token);
+            /* Ignore empty tokens between commas (e.g., stray commas). */
+            if (*trimmed != '\0') {
+                char *v = strdup(trimmed);
+                if (ac < MAX_MACRO_ARGS) {
+                    argstore[ac] = v;
+                    argvals[ac] = v;
+                }
+                ac++;
             }
-
-            ac++;
             tlen = 0;
             token[0] = '\0';
         } else {
