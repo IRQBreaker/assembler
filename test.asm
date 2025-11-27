@@ -102,7 +102,7 @@ singleq:
 ; -----------------------------------------------------------------------------
 ; Exhaustive tests for all legal opcodes and addressing modes
 ; -----------------------------------------------------------------------------
-.org $3400
+.org $3500
 
 ; Constants for operands
 ZP0 = $00
@@ -293,3 +293,34 @@ legal_opcodes:
     TXS
     TYA
     NOP
+
+; -----------------------------------------------------------------------------
+; Macro tests
+; -----------------------------------------------------------------------------
+.org $3700
+
+; Define a macro with two parameters and an internal loop label.
+.macro ClearScreen(screen,clearByte) {
+    lda #clearByte
+    ldx #0
+Loop:
+    sta screen,x
+    sta screen+$100,x
+    sta screen+$200,x
+    sta screen+$300,x
+    inx
+    bne Loop
+}
+
+; Invoke macro twice; internal label should not collide between calls.
+ClearScreen($0400,$20)
+ClearScreen($4400,$20)
+
+; Another small macro to test argument substitution in expressions and immediate.
+.macro AddImm(val) {
+    clc
+    adc #val
+}
+
+    lda #$10
+    AddImm(5)        ; becomes: clc / adc #5

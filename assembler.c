@@ -135,9 +135,38 @@ static int current_line_index = -1; /* used during second pass to resolve +/- */
 #define MAX_INCLUDE_DEPTH 64
 static int include_depth = 0;
 
+/* ------------- Macro system ------------- */
+#define MAX_MACROS 256
+#define MAX_MACRO_ARGS 16
+
+typedef struct macro_def
+{
+    char *name;
+    int argc;
+    char *argnames[MAX_MACRO_ARGS];
+    /* Raw body lines as read (without trailing newlines) */
+    char **body;
+    int body_count;
+    int body_cap;
+    /* Collected local labels defined in the body (tokens ending with ':') */
+    char **local_labels;
+    int local_count;
+    int local_cap;
+} macro_def_t;
+
+static macro_def_t macros[MAX_MACROS];
+static int macro_count = 0;
+static int macro_expand_counter = 0;
+
 /* Forward decl: loader that expands includes into global lines[] */
 static void read_file_with_includes(const char *path);
 static void expand_include(const char *including_path, const char *arg, int lineno);
+/* Macro support: forward decls */
+static void macro_init(void);
+static int  macro_try_define(FILE *fin, const char *path, const char *header_line, int *lineno);
+static int  macro_try_expand_and_emit(const char *path, const char *line, int lineno);
+/* Parser helper used by macro matcher */
+static void strip_comments_preserving_quotes(char *s);
 /* Forward declaration for opcode lookup used during parsing */
 const opcode_t *opcode_lookup(const char *mn, addrmode_t mode);
 /* Forward declaration: parse expression involving +, -, parentheses. */
@@ -145,6 +174,9 @@ int eval_expr(const char *expr, int *out);
 static int eval_parse_expr(const char **pp, int *out); /* forward */
 /* Forward decl for mnemonic check by name */
 int is_mnemonic_name(const char *name);
+/* Forward decl: line parser used by macro expansion */
+struct asm_line;
+struct asm_line *parse_line(const char *in, int lineno);
 
 /* Opcode table — all legal 6502 (documented) instructions */
 static const opcode_t opcode_table[] = {
@@ -458,11 +490,13 @@ static const opcode_t illegal_table[] = {
 void asm_error(int lineno, const char *fmt, ...)
 {
     va_list ap;
+
     fprintf(stderr, "Error (line %d): ", lineno);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fprintf(stderr, "\n");
+
     exit(1);
 }
 
@@ -470,15 +504,18 @@ void asm_error(int lineno, const char *fmt, ...)
 void asm_error_file(const char *file, int lineno, const char *fmt, ...)
 {
     va_list ap;
+
     if (file && *file) {
         fprintf(stderr, "Error (%s:%d): ", file, lineno);
     } else {
         fprintf(stderr, "Error (line %d): ", lineno);
     }
+
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fprintf(stderr, "\n");
+
     exit(1);
 }
 
@@ -502,6 +539,514 @@ char *trimws(char *s)
     }
 
     return s;
+}
+
+/* ------------- Macro system ------------- */
+
+static void macro_init(void)
+{
+    /* nothing to init beyond globals right now */
+}
+
+static macro_def_t *macro_find(const char *name)
+{
+    for (int i = 0; i < macro_count; ++i) {
+        if (strcasecmp(macros[i].name, name) == 0) {
+            return &macros[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int is_ident_start(char c)
+{
+    return (isalpha((unsigned char)c) || c == '_');
+}
+
+static int is_ident_char(char c)
+{
+    return (isalnum((unsigned char)c) || c == '_');
+}
+
+static void macro_collect_local_label(macro_def_t *m, const char *line)
+{
+    /* A local label is: optional ws, then identifier, then ':' */
+    const char *p = line;
+
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    const char *start = p;
+
+    if (!is_ident_start(*p)) {
+        return;
+    }
+
+    while (*p && is_ident_char(*p)) {
+        p++;
+    }
+
+    if (*p != ':') {
+        return;
+    }
+
+    size_t len = (size_t)(p - start);
+    if (len == 0) {
+        return;
+    }
+
+    char tmp[STRING_BUF];
+
+    if (len >= sizeof(tmp)) {
+        len = sizeof(tmp) - 1;
+    }
+
+    memcpy(tmp, start, len); tmp[len] = '\0';
+
+    /* Append to local label list if not present */
+    for (int i = 0; i < m->local_count; ++i) {
+        if (strcmp(m->local_labels[i], tmp) == 0) {
+            return;
+        }
+    }
+
+    if (m->local_count >= m->local_cap) {
+        m->local_cap = m->local_cap ? m->local_cap * 2 : 8;
+        m->local_labels = realloc(m->local_labels, m->local_cap * sizeof(char*));
+    }
+
+    m->local_labels[m->local_count++] = strdup(tmp);
+}
+
+static void macro_body_push_line(macro_def_t *m, const char *line)
+{
+    if (m->body_count >= m->body_cap) {
+        m->body_cap = m->body_cap ? m->body_cap * 2 : 16;
+        m->body = realloc(m->body, m->body_cap * sizeof(char*));
+    }
+
+    m->body[m->body_count++] = strdup(line);
+    macro_collect_local_label(m, line);
+}
+
+static void macro_register(const macro_def_t *src)
+{
+    if (macro_find(src->name)) {
+        asm_error(0, "Duplicate macro: %s", src->name);
+    }
+
+    if (macro_count >= MAX_MACROS) {
+        asm_error(0, "Too many macros defined");
+    }
+
+    macros[macro_count] = *src; /* shallow copy of owned pointers */
+    macro_count++;
+}
+
+/* Parse a .macro header line. Example:
+ *   .macro ClearScreen(screen,clearByte) {
+ * Accepts optional opening '{' at end. Returns 1 if header parsed, else 0. */
+static int macro_parse_header(const char *line, char *name_out, char argnames[][STRING_BUF], int *argc_out, int *has_open_brace)
+{
+    *argc_out = 0;
+    *has_open_brace = 0;
+    name_out[0] = '\0';
+
+    char buf[MAX_LINE_LEN];
+
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *s = trimws(buf);
+
+    if (strncasecmp(s, ".macro", 6) != 0) {
+        return 0;
+    }
+
+    s += 6;
+    s = trimws(s);
+
+    if (!is_ident_start(*s)) {
+        return 0;
+    }
+
+    /* name */
+    char *p = s; int nlen = 0;
+
+    while (*p && is_ident_char(*p)) {
+        if (nlen < STRING_BUF-1) {
+            name_out[nlen++] = *p;
+        }
+
+        p++;
+    }
+
+    name_out[nlen] = '\0';
+
+    s = trimws(p);
+    if (*s != '(') {
+        return 0;
+    }
+
+    s++;
+
+    /* args until ')' */
+    int argc = 0;
+
+    while (1) {
+        s = trimws(s);
+
+        if (*s == ')') {
+            s++;
+            break;
+        }
+
+        if (!is_ident_start(*s)) {
+            return 0;
+        }
+
+        int alen = 0;
+
+        while (*s && is_ident_char(*s)) {
+            if (alen < STRING_BUF-1) {
+                argnames[argc][alen++] = *s;
+            }
+
+            s++;
+        }
+
+        argnames[argc][alen] = '\0';
+        argc++;
+
+        if (argc > MAX_MACRO_ARGS) {
+            asm_error(0, "Too many macro arguments in %s", name_out);
+        }
+
+        s = trimws(s);
+
+        if (*s == ',') {
+            s++;
+            continue;
+        }
+
+        if (*s == ')') {
+            s++;
+            break;
+        }
+
+        return 0;
+    }
+
+    s = trimws(s);
+    if (*s == '{') {
+        *has_open_brace = 1;
+    }
+
+    *argc_out = argc;
+
+    return 1;
+}
+
+/* Try to parse and define a macro given the header line already read.
+ * Consumes lines from 'fin' until '}' or '.endmacro'.
+ * Returns 1 if a macro was defined, 0 if header_line isn't a macro. */
+static int macro_try_define(FILE *fin, const char *path, const char *header_line, int *lineno)
+{
+    char name[STRING_BUF];
+    char args_buf[MAX_MACRO_ARGS][STRING_BUF];
+    int argc = 0;
+    int has_brace = 0;
+
+    if (!macro_parse_header(header_line, name, args_buf, &argc, &has_brace)) {
+        return 0;
+    }
+
+    macro_def_t m;
+    memset(&m, 0, sizeof(m));
+    m.name = strdup(name);
+    m.argc = argc;
+
+    for (int i = 0; i < argc; ++i) {
+        m.argnames[i] = strdup(args_buf[i]);
+    }
+
+    /* If header has no opening '{', require next non-empty line to be '{' or start body until .endmacro */
+    char linebuf[MAX_LINE_LEN];
+    int seen_open = has_brace;
+
+    while (fgets(linebuf, sizeof(linebuf), fin)) {
+        (*lineno)++;
+
+        /* Remove trailing newline */
+        size_t L = strlen(linebuf);
+        if (L && (linebuf[L-1] == '\n' || linebuf[L-1] == '\r')) {
+            linebuf[L-1] = '\0';
+        }
+
+        char tmp[MAX_LINE_LEN];
+        strncpy(tmp, linebuf, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+        char *t = trimws(tmp);
+
+        /* strip comments for control tokens but keep original in body */
+        if (!seen_open) {
+            if (*t == '{') {
+                seen_open = 1;
+                continue;
+            }
+
+            /* allow immediate body line if using .macro ... (no brace style) */
+            seen_open = 1; /* start body now */
+        }
+
+        if (*t == '\0') {
+            /* keep empty line */
+            macro_body_push_line(&m, "");
+            continue;
+        }
+
+        if (*t == '}' || strcasecmp(t, ".endmacro") == 0) {
+            macro_register(&m);
+            return 1;
+        }
+
+        macro_body_push_line(&m, linebuf);
+    }
+
+    asm_error_file(path, *lineno, "Unterminated .macro %s", name);
+
+    return 0; /* not reached */
+}
+
+/* Replace identifiers in 'in' based on simple token table. tokens[i] -> repl[i], ntok entries. */
+static char *replace_ident_tokens(const char *in, const char **tokens, const char **repl, int ntok)
+{
+    size_t cap = strlen(in) + 64;
+    size_t len = 0;
+    char *out = malloc(cap);
+    const char *p = in;
+
+    while (*p) {
+        if (is_ident_start(*p)) {
+            char id[STRING_BUF];
+            int ilen = 0;
+            const char *q = p;
+
+            while (*q && is_ident_char(*q)) {
+                if (ilen < (int)sizeof(id)-1) {
+                    id[ilen++] = *q;
+                }
+                q++;
+            }
+
+            id[ilen] = '\0';
+            int replaced = 0;
+
+            for (int i = 0; i < ntok; ++i) {
+                if (strcmp(id, tokens[i]) == 0) {
+                    const char *r = repl[i];
+                    size_t rl = strlen(r);
+
+                    if (len + rl + 1 > cap) {
+                        cap = (len + rl + 64)*2;
+                        out = realloc(out, cap);
+                    }
+
+                    memcpy(out + len, r, rl);
+                    len += rl;
+                    out[len] = '\0';
+                    p = q;
+                    replaced = 1;
+                    break;
+                }
+            }
+
+            if (!replaced) {
+                if (len + (size_t)ilen + 1 > cap) {
+                    cap = (len + ilen + 64)*2;
+                    out = realloc(out, cap);
+                }
+
+                memcpy(out + len, id, (size_t)ilen);
+                len += (size_t)ilen;
+                out[len] = '\0';
+                p = q;
+            }
+
+            continue;
+        }
+
+        /* copy single char */
+        if (len + 2 > cap) {
+            cap = (len + 64)*2;
+            out = realloc(out, cap);
+        }
+
+        out[len++] = *p++;
+        out[len] = '\0';
+    }
+
+    return out;
+}
+
+/* Attempt to match and expand a macro invocation line, emitting expanded lines into lines[]
+ * Returns 1 if expanded, 0 if not a macro call. */
+static int macro_try_expand_and_emit(const char *path, const char *orig_line, int lineno)
+{
+    /* Work on a comment-free copy to detect calls; preserve original for parsing */
+    char work[MAX_LINE_LEN];
+    strncpy(work, orig_line, sizeof(work)-1);
+    work[sizeof(work)-1] = '\0';
+
+    strip_comments_preserving_quotes(work);
+
+    char *s = trimws(work);
+
+    if (!is_ident_start(*s)) {
+        return 0;
+    }
+
+    /* name */
+    char name[STRING_BUF];
+    int nlen = 0;
+    const char *p = s;
+
+    while (*p && is_ident_char(*p)) {
+        if (nlen < STRING_BUF-1) {
+            name[nlen++] = *p;
+        }
+        p++;
+    }
+
+    name[nlen] = '\0';
+
+    const macro_def_t *m = macro_find(name);
+    if (!m) {
+        return 0;
+    }
+
+    p = (const char *)trimws((char*)p);
+    if (*p != '(') {
+        return 0;
+    }
+
+    p++;
+
+    /* parse args CSV respecting parentheses nesting (simple, no strings) */
+    const char *argvals[MAX_MACRO_ARGS];
+    char *argstore[MAX_MACRO_ARGS];
+    int ac = 0;
+    char token[MAX_LINE_LEN];
+    int tlen = 0;
+    int depth = 0;
+
+    while (*p) {
+        char c = *p++;
+
+        if (c == '(') {
+            depth++;
+            token[tlen++] = c;
+        } else if (c == ')') {
+            if (depth == 0) {
+                /* end of args */
+                token[tlen] = '\0';
+                char *v = strdup(trimws(token));
+
+                if (ac < MAX_MACRO_ARGS) {
+                    argstore[ac] = v;
+                    argvals[ac] = v;
+                }
+
+                ac++;
+                break;
+            } else {
+                depth--;
+                token[tlen++] = c;
+            }
+        } else if (c == ',' && depth == 0) {
+            token[tlen] = '\0';
+
+            char *v = strdup(trimws(token));
+
+            if (ac < MAX_MACRO_ARGS) {
+                argstore[ac] = v;
+                argvals[ac] = v;
+            }
+
+            ac++;
+            tlen = 0;
+            token[0] = '\0';
+        } else {
+            if (tlen < (int)sizeof(token)-1) {
+                token[tlen++] = c;
+            }
+        }
+    }
+
+    if (ac != m->argc) {
+        asm_error_file(path, lineno, "Macro %s expects %d args, got %d", m->name, m->argc, ac);
+    }
+
+    /* Build replacement tables: first local label rename, then arg substitution. */
+    int uid = ++macro_expand_counter;
+    const char *tok_keys[MAX_MACRO_ARGS + 64];
+    const char *tok_vals[MAX_MACRO_ARGS + 64];
+    int ntok = 0;
+
+    /* local labels */
+    char **ll_new = NULL;
+    int ll_cnt = 0;
+
+    if (m->local_count > 0) {
+        ll_cnt = m->local_count;
+        ll_new = malloc((size_t)ll_cnt * sizeof(char*));
+
+        for (int i = 0; i < ll_cnt; ++i) {
+            tok_keys[ntok] = m->local_labels[i];
+            char buf[STRING_BUF];
+            snprintf(buf, sizeof(buf), "__m%d_%s", uid, m->local_labels[i]);
+            ll_new[i] = strdup(buf);
+            tok_vals[ntok] = ll_new[i];
+            ntok++;
+        }
+    }
+
+    /* params */
+    for (int i = 0; i < m->argc; ++i) {
+        tok_keys[ntok] = m->argnames[i];
+        tok_vals[ntok] = argvals[i < MAX_MACRO_ARGS ? i : 0];
+        ntok++;
+    }
+
+    /* For each body line: apply replacements; then parse and push. */
+    for (int i = 0; i < m->body_count; ++i) {
+        char *repl = replace_ident_tokens(m->body[i], tok_keys, tok_vals, ntok);
+        asm_line_t *ln = parse_line(repl, lineno);
+
+        if (ln) {
+            ln->filename = strdup(path);
+            lines[line_count++] = ln;
+            if (line_count >= MAX_LINES) {
+                asm_error_file(path, lineno, "Too many lines in input (macro expansion)");
+            }
+        }
+
+        free(repl);
+    }
+
+    /* cleanup */
+    for (int i = 0; i < ll_cnt; ++i) {
+        free(ll_new[i]);
+    }
+
+    free(ll_new);
+
+    for (int i = 0; i < ac && i < MAX_MACRO_ARGS; ++i) {
+        free(argstore[i]);
+    }
+
+    return 1;
 }
 
 /* Parse a number literal. Supports:
@@ -1140,7 +1685,10 @@ static int resolve_minus_addr_k(int line_index, int k, int *out_addr)
             k--;
 
             if (k == 0) {
-                if (out_addr) *out_addr = minus_pc[m];
+                if (out_addr) {
+                    *out_addr = minus_pc[m];
+                }
+
                 return 1;
             }
         }
@@ -1156,7 +1704,10 @@ static int resolve_plus_addr_k(int line_index, int k, int *out_addr)
             k--;
 
             if (k == 0) {
-                if (out_addr) *out_addr = plus_pc[p];
+                if (out_addr) {
+                    *out_addr = plus_pc[p];
+                }
+
                 return 1;
             }
         }
@@ -1250,6 +1801,18 @@ static int parse_org_value_file(const char *file, const char *extra, int lineno,
     g_eval_pc = pc;
 
     if (parse_number(expr, &v) || eval_expr(expr, &v)) {
+        if (v < 0 || v > WORD_MAX) {
+            asm_error_file(file, lineno, "Origin out of 16-bit range: %d", v);
+        }
+
+        /* Warn if origin moves backwards, as this can overwrite prior bytes
+         * and leave trailing data beyond the new segment end. */
+        if (v < pc) {
+            fprintf(stderr,
+                    "Warning (%s:%d): .org moving PC backwards from $%04X to $%04X; bytes previously assembled beyond new origin will remain in output.\n",
+                    file ? file : "<input>", lineno, pc & 0xFFFF, v & 0xFFFF);
+        }
+
         return v;
     }
 
@@ -1551,9 +2114,12 @@ static int resolve_value_from_expr(const char *expr,
                                    int lineno,
                                    int *out)
 {
-    char kind; int n;
+    char kind;
+    int n;
+
     if (parse_local_ref(expr, &kind, &n)) {
         int addr;
+
         if (kind == '-') {
             if (!resolve_minus_addr_k(line_index, n, &addr)) {
                 asm_error_file(file, lineno, "No matching '-' label found");
@@ -1563,11 +2129,13 @@ static int resolve_value_from_expr(const char *expr,
                 asm_error_file(file, lineno, "No matching '+' label found");
             }
         }
+
         *out = addr;
         return 1;
     }
 
     g_eval_pc = pc;
+
     if (eval_expr(expr, out) || parse_number(expr, out)) {
         return 1;
     }
@@ -1914,6 +2482,8 @@ static int is_directive_name(const char *t)
            (strcasecmp(t, ".text") == 0) ||
            (strcasecmp(t, ".incbin") == 0) ||
            (strcasecmp(t, ".include") == 0) ||
+           (strcasecmp(t, ".macro") == 0) ||
+           (strcasecmp(t, ".endmacro") == 0) ||
            (strcmp(t, "*") == 0);
 }
 
@@ -2049,7 +2619,9 @@ asm_line_t *parse_line(const char *in, int lineno)
     /* Support label without colon if the entire line is a single token that is
      * NOT a known mnemonic or directive. */
     if (!colon) {
-        if (maybe_parse_bare_label(&s, ln, 0)) return ln; /* pure label */
+        if (maybe_parse_bare_label(&s, ln, 0)) {
+            return ln; /* pure label */
+        }
     }
 
     /* mnemonic / directive */
@@ -2210,7 +2782,9 @@ static void expand_include(const char *including_path, const char *arg, int line
 
 static void read_file_with_includes(const char *path)
 {
-    if (!path) return;
+    if (!path) {
+        return;
+    }
 
     if (include_depth >= MAX_INCLUDE_DEPTH) {
         fprintf(stderr, "Error: include nesting too deep while opening %s\n", path);
@@ -2230,7 +2804,20 @@ static void read_file_with_includes(const char *path)
 
     while (fgets(linebuf, sizeof(linebuf), fin)) {
         lineno++;
+        /* remove trailing newline */
+        size_t L = strlen(linebuf); if (L && (linebuf[L-1] == '\n' || linebuf[L-1] == '\r')) linebuf[L-1] = '\0';
 
+        /* Macro definition? If so, it consumes its block and does not emit a line. */
+        if (macro_try_define(fin, path, linebuf, &lineno)) {
+            continue;
+        }
+
+        /* Macro invocation? Expand into lines immediately. */
+        if (macro_try_expand_and_emit(path, linebuf, lineno)) {
+            continue;
+        }
+
+        /* Normal line path */
         asm_line_t *ln = parse_line(linebuf, lineno);
         if (!ln) {
             continue;
@@ -2306,6 +2893,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    macro_init();
     read_file_with_includes(in_path);
 
     /* Reset output buffer so regions between .org segments are zero-filled */

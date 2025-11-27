@@ -76,3 +76,28 @@ Examples
 - Labelled string: 'hello: .text "hello world"' (emits 11 bytes at 'hello').
 - Single quotes: '.text 'ABC xyz'' (emits 7 bytes).
 - Note: Only a single quoted string is accepted per directive; use multiple '.text' lines to concatenate.
+
+Macros
+- Define with '.macro Name(arg1,arg2,...) { ... }' and close with '}' (or use '.endmacro').
+- Invoke with 'Name(val1,val2,...)' on its own line (no leading label).
+- Arguments substitute as identifiers inside the body (e.g., 'lda #arg', 'sta addr+$100,x').
+- Labels defined inside the macro (e.g., 'Loop:') are local to each invocation and auto‑renamed; references inside the body (e.g., 'bne Loop') update accordingly.
+- Example:
+  .macro ClearScreen(screen,clearByte) {
+      lda #clearByte
+      ldx #0
+  Loop:
+      sta screen,x
+      sta screen+$100,x
+      sta screen+$200,x
+      sta screen+$300,x
+      inx
+      bne Loop
+  }
+
+  ClearScreen($0400,$20)
+  ClearScreen($4400,$20)
+
+Notes:
+- Macro expansion happens before both assembler passes.
+- '.include' inside macros is not special; prefer top‑level includes.
