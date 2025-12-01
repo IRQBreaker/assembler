@@ -20,6 +20,7 @@ Directives
 - 'NAME = expr': define a constant symbol with the value of 'expr' (usable later like a label).
 - '.incbin "file"': include bytes from an external file (single or double quotes accepted).
 - '.include "file.asm"': inline another assembly source file at this point. Paths are resolved relative to the including file; nested includes are supported.
+- '.block' / '.bend': open/close a lexical scope for labels. Labels defined inside a block are local to that block and any nested sub‑blocks, and go out of scope at the matching '.bend'. Labels defined outside remain visible inside blocks. Constant definitions ('NAME = expr') are global and remain visible everywhere.
 
 Expressions
 - Use labels and numbers in expressions with '+ - * /' and parentheses.

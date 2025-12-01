@@ -351,3 +351,44 @@ ClearScreen($4400,$20)
 .fill 256, 1
 
 foobar .fill 256, 2
+
+; -----------------------------------------------------------------------------
+; Block scoping tests (.block / .bend)
+; -----------------------------------------------------------------------------
+.org $3A00
+
+; Outer label visible in inner blocks
+Outer:
+    NOP
+
+.block
+Inner:
+    NOP
+    ; Inner sees itself and outer
+    .word Inner
+    .word Outer
+
+; Shadowing test: inner X vs outer X
+X:
+    NOP
+    .word X      ; refers to inner X
+.bend
+
+    .word Outer  ; still visible after block
+
+; Define outer X now; references after .bend use this one
+X:
+    NOP
+    .word X      ; refers to outer X
+
+; Nested block visibility
+.block
+Mid:
+    NOP
+    .block
+Deep:
+        NOP
+        .word Mid    ; refer to parent block label
+        .word Outer  ; refer to outermost label
+    .bend
+.bend

@@ -84,6 +84,8 @@ typedef struct symbol
 {
     char *name;
     int addr;
+    int scope_depth; /* 0 = global, >0 = inside .block nesting */
+    int is_label;    /* 1 if label (scoped), 0 if define (global) */
 } symbol_t;
 
 /* Opcode table entry */
@@ -105,7 +107,9 @@ typedef enum dir_kind
     DIR_BYTE,
     DIR_WORD,
     DIR_TEXT,
-    DIR_FILL
+    DIR_FILL,
+    DIR_BLOCK_START,
+    DIR_BLOCK_END
 } dir_kind_t;
 
 /* Globals */
@@ -114,6 +118,9 @@ static int line_count = 0;
 
 static symbol_t symtab[MAX_SYMBOLS];
 static int sym_count = 0;
+/* Track lexical scope depth per source line and current scope during eval */
+static int line_scope_depth[MAX_LINES];
+static int current_scope_depth = 0;
 
 static uint8_t outbuf[MAX_OUTPUT];
 static int out_lo = MAX_OUTPUT;
@@ -1061,10 +1068,10 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
 }
 
 /* Parse a number literal. Supports:
- * - Hex: `$1A2B` or `0x1A2B`
- * - Binary: `%1010` or `0b1010`
- * - Decimal: `1234`
- * Returns 1 on success (value in `*out`), otherwise 0.
+ * - Hex: '$1A2B' or '0x1A2B'
+ * - Binary: '%1010' or '0b1010'
+ * - Decimal: '1234'
+ * Returns 1 on success (value in '*out'), otherwise 0.
  */
 int parse_number(const char *s, int *out)
 {
@@ -1139,7 +1146,7 @@ int parse_number(const char *s, int *out)
  * and either capture a literal value or keep the expression string to
  * resolve later in the second pass.
  */
-/* ---- Helpers to flatten parse_operand ---- */
+
 static int set_immediate_operand(const char *s, operand_t *op)
 {
     if (*s != CHAR_HASH) {
@@ -1335,6 +1342,7 @@ operand_t parse_operand(const char *s0)
 /* Symbol table lookup: return address for name, or -1 if not found. */
 int sym_lookup(const char *name)
 {
+    /* Backward-compat: flat global lookup. */
     for (int i = 0; i < sym_count; i++) {
         if (strcmp(symtab[i].name, name) == 0) {
             return symtab[i].addr;
@@ -1344,15 +1352,67 @@ int sym_lookup(const char *name)
     return -1;
 }
 
-/* Add a symbol to the table, erroring on duplicates. */
-void sym_add(const char *name, int addr, const char *file, int lineno)
+/* Scoped symbol lookup: prefer nearest (highest) scope <= depth; fall back to global defines */
+static int sym_lookup_scoped(const char *name, int depth)
 {
-    if (sym_lookup(name) >= 0) {
-        asm_error_file(file, lineno, "Duplicate symbol: %s", name);
+    int best_idx = -1;
+    int best_scope = -1;
+
+    for (int i = 0; i < sym_count; i++) {
+        if (strcmp(symtab[i].name, name) == 0 && symtab[i].is_label) {
+            int sd = symtab[i].scope_depth;
+
+            if (sd <= depth && sd >= 0) {
+                if (sd > best_scope) {
+                    best_scope = sd;
+                    best_idx = i;
+                }
+            }
+        }
+    }
+
+    if (best_idx >= 0) {
+        return symtab[best_idx].addr;
+    }
+
+    /* fall back to defines (treated as global) */
+    for (int i = 0; i < sym_count; i++) {
+        if (strcmp(symtab[i].name, name) == 0 && !symtab[i].is_label) {
+            return symtab[i].addr;
+        }
+    }
+
+    return -1;
+}
+
+/* Add a symbol with explicit scoping. For labels, duplicates are not allowed within the same scope.
+ * For defines, duplicates are not allowed globally. */
+static void sym_add_scoped(const char *name, int addr, int scope_depth_in, int is_label, const char *file, int lineno)
+{
+    if (is_label) {
+        /* disallow duplicate label in same scope */
+        for (int i = 0; i < sym_count; ++i) {
+            if (symtab[i].is_label && symtab[i].scope_depth == scope_depth_in && strcmp(symtab[i].name, name) == 0) {
+                asm_error_file(file, lineno, "Duplicate label in scope: %s", name);
+            }
+        }
+    } else {
+        /* define: must be unique by name (global semantics) */
+        for (int i = 0; i < sym_count; ++i) {
+            if (!symtab[i].is_label && strcmp(symtab[i].name, name) == 0) {
+                asm_error_file(file, lineno, "Duplicate define: %s", name);
+            }
+        }
+    }
+
+    if (sym_count >= MAX_SYMBOLS) {
+        asm_error_file(file, lineno, "Too many symbols");
     }
 
     symtab[sym_count].name = strdup(name);
     symtab[sym_count].addr = addr;
+    symtab[sym_count].scope_depth = is_label ? scope_depth_in : 0;
+    symtab[sym_count].is_label = is_label ? 1 : 0;
     sym_count++;
 }
 
@@ -1470,7 +1530,7 @@ static int eval_parse_factor(const char **pp, int *out)
             return 1;
         }
 
-        int s = sym_lookup(tok);
+        int s = sym_lookup_scoped(tok, current_scope_depth);
         if (s < 0) {
             return 0;
         }
@@ -1758,6 +1818,16 @@ static int is_fill_dir(const asm_line_t *ln)
     return (ln->mnemonic && (strcasecmp(ln->mnemonic, ".fill") == 0));
 }
 
+static int is_block_start(const asm_line_t *ln)
+{
+    return (ln->mnemonic && (strcasecmp(ln->mnemonic, ".block") == 0));
+}
+
+static int is_block_end(const asm_line_t *ln)
+{
+    return (ln->mnemonic && (strcasecmp(ln->mnemonic, ".bend") == 0));
+}
+
 static int is_define(const asm_line_t *ln)
 {
     return (ln && ln->def_name != NULL && ln->def_expr != NULL);
@@ -1795,6 +1865,14 @@ static dir_kind_t classify_directive(const asm_line_t *ln)
 
     if (is_fill_dir(ln)) {
         return DIR_FILL;
+    }
+
+    if (is_block_start(ln)) {
+        return DIR_BLOCK_START;
+    }
+
+    if (is_block_end(ln)) {
+        return DIR_BLOCK_END;
     }
 
     return DIR_NONE;
@@ -1946,7 +2024,7 @@ static void first_handle_fill(const asm_line_t *ln, int *pc)
     g_eval_pc = *pc;
     if (!(parse_number(size_tok, &size_val) || eval_expr(size_tok, &size_val))) {
         /* try symbol lookup of bare name */
-        int s = sym_lookup(size_tok);
+        int s = sym_lookup_scoped(size_tok, current_scope_depth);
         if (s < 0) {
             asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill size: %s", ln->extra);
         }
@@ -2041,7 +2119,7 @@ static void first_handle_define(const asm_line_t *ln, int *pc)
 
     if (!(parse_number(def_expr, &v) || eval_expr(def_expr, &v))) {
         /* Try symbol lookup if it's a bare name */
-        int s = sym_lookup(def_expr);
+        int s = sym_lookup_scoped(def_expr, current_scope_depth);
         if (s < 0) {
             asm_error_file(ln->filename, ln->lineno, "Bad expression in define: %s = %s",
                       ln->def_name, ln->def_expr);
@@ -2049,7 +2127,7 @@ static void first_handle_define(const asm_line_t *ln, int *pc)
         v = s;
     }
 
-    sym_add(ln->def_name, v, ln->filename, ln->lineno);
+    sym_add_scoped(ln->def_name, v, 0, 0, ln->filename, ln->lineno);
 }
 
 /* FIRST PASS: Assign addresses (PC) and build symbol table. */
@@ -2061,12 +2139,19 @@ void first_pass(void)
     /* reset +/- markers */
     minus_count = 0;
     plus_count = 0;
+    /* reset scope tracking */
+    memset(line_scope_depth, 0, sizeof(line_scope_depth));
+    current_scope_depth = 0;
+    int scope_depth = 0;
 
     for (int i = 0; i < line_count; i++) {
         asm_line_t *ln = lines[i];
         if (!ln) {
             continue;
         }
+
+        line_scope_depth[i] = scope_depth;
+        current_scope_depth = scope_depth;
 
         if (ln->label) {
             /* Accept sequences of '-' or '+' as local temp labels too */
@@ -2095,8 +2180,8 @@ void first_pass(void)
                     plus_count++;
                 }
             } else {
-                DEBUG_PRINT("Found label: \"%s\" at 0x%04x\n", ln->label, pc);
-                sym_add(ln->label, pc, ln->filename, ln->lineno);
+                DEBUG_PRINT("Found label: \"%s\" at 0x%04x (scope %d)\n", ln->label, pc, scope_depth);
+                sym_add_scoped(ln->label, pc, scope_depth, 1, ln->filename, ln->lineno);
             }
         }
 
@@ -2133,10 +2218,29 @@ void first_pass(void)
                 first_handle_fill(ln, &pc);
                 break;
 
+            case DIR_BLOCK_START:
+                /* Increase scope depth AFTER this line so labels on this line are outer */
+                scope_depth++;
+                current_scope_depth = scope_depth;
+                break;
+
+            case DIR_BLOCK_END:
+                if (scope_depth == 0) {
+                    asm_error_file(ln->filename, ln->lineno, ".bend without matching .block");
+                }
+
+                scope_depth--;
+                current_scope_depth = scope_depth;
+                break;
+
             case DIR_NONE:
                 first_handle_instruction(ln, &pc);
                 break;
         }
+    }
+
+    if (scope_depth != 0) {
+        asm_error(0, "Unterminated .block (missing .bend)");
     }
 }
 
@@ -2196,12 +2300,13 @@ static int resolve_value_from_expr(const char *expr,
     }
 
     g_eval_pc = pc;
+    current_scope_depth = (line_index >= 0 && line_index < MAX_LINES) ? line_scope_depth[line_index] : 0;
 
     if (eval_expr(expr, out) || parse_number(expr, out)) {
         return 1;
     }
 
-    int s = sym_lookup(expr);
+    int s = sym_lookup_scoped(expr, current_scope_depth);
     if (s < 0) {
         asm_error_file(file, lineno, "Undefined label %s", expr);
     }
@@ -2465,6 +2570,7 @@ void second_pass(void)
     for (int i = 0; i < line_count; i++) {
         asm_line_t *ln = lines[i];
         current_line_index = i;
+        current_scope_depth = (i >= 0 && i < MAX_LINES) ? line_scope_depth[i] : 0;
 
         if (!ln || !ln->mnemonic) {
             continue;
@@ -2501,6 +2607,11 @@ void second_pass(void)
 
             case DIR_FILL:
                 second_handle_fill(ln, &pc);
+                break;
+
+            case DIR_BLOCK_START:
+            case DIR_BLOCK_END:
+                /* purely scoping; no effect in second pass */
                 break;
         }
     }
@@ -2597,6 +2708,8 @@ static int is_directive_name(const char *t)
            (strcasecmp(t, ".text") == 0) ||
            (strcasecmp(t, ".fill") == 0) ||
            (strcasecmp(t, ".incbin") == 0) ||
+           (strcasecmp(t, ".block") == 0) ||
+           (strcasecmp(t, ".bend") == 0) ||
            (strcasecmp(t, ".include") == 0) ||
            (strcasecmp(t, ".macro") == 0) ||
            (strcasecmp(t, ".endmacro") == 0) ||
