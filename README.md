@@ -74,6 +74,10 @@ CLI Options
 - '--prg-header | -H': write 2‑byte load address header (default).
 - '--no-prg-header | -N': disable load address header.
 - '--illegal-opcodes | -I': enable unofficial ("illegal") NMOS 6502 opcodes (see below).
+- '--map <file> | -M <file>': emit a symbol map file. Default is off.
+  - Format: one symbol per line — `$ADDR TYPE SCOPE NAME`
+    - `TYPE`: `label` or `define`
+    - `SCOPE`: lexical scope depth (labels only; defines are `0`)
 
 Unofficial 6502 Opcodes (when '-I' is enabled)
 - Combos (read‑modify‑write):
@@ -103,3 +107,9 @@ Examples
 - Labelled string: 'hello: .text "hello world"' (emits 11 bytes at 'hello').
 - Single quotes: '.text 'ABC xyz'' (emits 7 bytes).
 - Note: Only a single quoted string is accepted per directive; use multiple '.text' lines to concatenate.
+
+Symbols and Scopes
+- Labels can be scoped using '.block'/' .bend'. Lookups prefer the nearest visible label in the current scope chain.
+- Constant definitions (`NAME = expr`) are global and never scoped.
+- Temporary labels `-`/`+` are supported for backward/forward jumps; counts select nth previous/next occurrence.
+- See 'DEVELOPER.md' for an architectural overview of parsing, passes, and scoping.

@@ -528,25 +528,25 @@ void asm_error_file(const char *file, int lineno, const char *fmt, ...)
 }
 
 /* Trim whitespace (leading and trailing) in-place and return the new start. */
-char *trimws(char *s)
+char *trimws(char *str)
 {
-    while (*s && isspace((unsigned char)*s)) {
-        s++;
+    while (*str && isspace((unsigned char)*str)) {
+        str++;
     }
 
-    size_t len = strlen(s);
+    size_t len = strlen(str);
     if (len == 0) {
-        return s;
+        return str;
     }
 
-    char *e = s + len - 1;
+    char *end = str + len - 1;
 
-    while (e >= s && isspace((unsigned char)*e)) {
-        *e = '\0';
-        e--;
+    while (end >= str && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
     }
 
-    return s;
+    return str;
 }
 
 /* ------------- Macro system ------------- */
@@ -759,32 +759,32 @@ static int macro_parse_header(const char *line, char *name_out, char argnames[][
 /* Try to parse and define a macro given the header line already read.
  * Consumes lines from 'fin' until '}' or '.endmacro'.
  * Returns 1 if a macro was defined, 0 if header_line isn't a macro. */
-static int macro_try_define(FILE *fin, const char *path, const char *header_line, int *lineno)
+static int macro_try_define(FILE *input_file, const char *source_path, const char *header_line_text, int *line_no)
 {
-    char name[STRING_BUF];
-    char args_buf[MAX_MACRO_ARGS][STRING_BUF];
+    char macro_name[STRING_BUF];
+    char argnames_buf[MAX_MACRO_ARGS][STRING_BUF];
     int argc = 0;
-    int has_brace = 0;
+    int has_open_brace = 0;
 
-    if (!macro_parse_header(header_line, name, args_buf, &argc, &has_brace)) {
+    if (!macro_parse_header(header_line_text, macro_name, argnames_buf, &argc, &has_open_brace)) {
         return 0;
     }
 
     macro_def_t m;
     memset(&m, 0, sizeof(m));
-    m.name = strdup(name);
+    m.name = strdup(macro_name);
     m.argc = argc;
 
     for (int i = 0; i < argc; ++i) {
-        m.argnames[i] = strdup(args_buf[i]);
+        m.argnames[i] = strdup(argnames_buf[i]);
     }
 
     /* If header has no opening '{', require next non-empty line to be '{' or start body until .endmacro */
     char linebuf[MAX_LINE_LEN];
-    int seen_open = has_brace;
+    int seen_open = has_open_brace;
 
-    while (fgets(linebuf, sizeof(linebuf), fin)) {
-        (*lineno)++;
+    while (fgets(linebuf, sizeof(linebuf), input_file)) {
+        (*line_no)++;
 
         /* Remove trailing newline */
         size_t L = strlen(linebuf);
@@ -823,18 +823,18 @@ static int macro_try_define(FILE *fin, const char *path, const char *header_line
         macro_body_push_line(&m, linebuf);
     }
 
-    asm_error_file(path, *lineno, "Unterminated .macro %s", name);
+    asm_error_file(source_path, *line_no, "Unterminated .macro %s", macro_name);
 
     return 0; /* not reached */
 }
 
 /* Replace identifiers in 'in' based on simple token table. tokens[i] -> repl[i], ntok entries. */
-static char *replace_ident_tokens(const char *in, const char **tokens, const char **repl, int ntok)
+static char *replace_ident_tokens(const char *in_text, const char **tokens, const char **repl, int token_count)
 {
-    size_t cap = strlen(in) + 64;
+    size_t cap = strlen(in_text) + 64;
     size_t len = 0;
     char *out = malloc(cap);
-    const char *p = in;
+    const char *p = in_text;
 
     while (*p) {
         if (is_ident_start(*p)) {
@@ -852,7 +852,7 @@ static char *replace_ident_tokens(const char *in, const char **tokens, const cha
             id[ilen] = '\0';
             int replaced = 0;
 
-            for (int i = 0; i < ntok; ++i) {
+            for (int i = 0; i < token_count; ++i) {
                 if (strcmp(id, tokens[i]) == 0) {
                     const char *r = repl[i];
                     size_t rl = strlen(r);
@@ -901,11 +901,11 @@ static char *replace_ident_tokens(const char *in, const char **tokens, const cha
 
 /* Attempt to match and expand a macro invocation line, emitting expanded lines into lines[]
  * Returns 1 if expanded, 0 if not a macro call. */
-static int macro_try_expand_and_emit(const char *path, const char *orig_line, int lineno)
+static int macro_try_expand_and_emit(const char *source_path, const char *original_line, int source_line)
 {
     /* Work on a comment-free copy to detect calls; preserve original for parsing */
     char work[MAX_LINE_LEN];
-    strncpy(work, orig_line, sizeof(work)-1);
+    strncpy(work, original_line, sizeof(work)-1);
     work[sizeof(work)-1] = '\0';
 
     strip_comments_preserving_quotes(work);
@@ -1003,7 +1003,7 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
     }
 
     if (ac != m->argc) {
-        asm_error_file(path, lineno, "Macro %s expects %d args, got %d", m->name, m->argc, ac);
+        asm_error_file(source_path, source_line, "Macro %s expects %d args, got %d", m->name, m->argc, ac);
     }
 
     /* Build replacement tables: first local label rename, then arg substitution. */
@@ -1040,13 +1040,13 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
     /* For each body line: apply replacements; then parse and push. */
     for (int i = 0; i < m->body_count; ++i) {
         char *repl = replace_ident_tokens(m->body[i], tok_keys, tok_vals, ntok);
-        asm_line_t *ln = parse_line(repl, lineno);
+        asm_line_t *ln = parse_line(repl, source_line);
 
         if (ln) {
-            ln->filename = strdup(path);
+            ln->filename = strdup(source_path);
             lines[line_count++] = ln;
             if (line_count >= MAX_LINES) {
-                asm_error_file(path, lineno, "Too many lines in input (macro expansion)");
+                asm_error_file(source_path, source_line, "Too many lines in input (macro expansion)");
             }
         }
 
@@ -1073,70 +1073,70 @@ static int macro_try_expand_and_emit(const char *path, const char *orig_line, in
  * - Decimal: '1234'
  * Returns 1 on success (value in '*out'), otherwise 0.
  */
-int parse_number(const char *s, int *out)
+int parse_number(const char *str, int *out_value)
 {
-    if (!s || !*s) {
+    if (!str || !*str) {
         return 0;
     }
 
     /* Binary: %1010 or 0b1010 */
-    if (s[0] == '%') {
+    if (str[0] == '%') {
         char *end;
-        long v = strtol(s + 1, &end, 2);
+        long v = strtol(str + 1, &end, 2);
 
         if (*end != '\0') {
             return 0;
         }
 
-        *out = (int)v;
+        *out_value = (int)v;
         return 1;
     }
 
-    if (s[0] == CHAR_DOLLAR) {
+    if (str[0] == CHAR_DOLLAR) {
         char *end;
-        long v = strtol(s + 1, &end, 16);
+        long v = strtol(str + 1, &end, 16);
 
         if (*end != '\0') {
             return 0;
         }
 
-        *out = (int)v;
+        *out_value = (int)v;
         return 1;
     }
 
     /* Decimal fallback, allow leading 0x too */
-    if (strncmp(s, "0x", 2) == 0 || strncmp(s, "0X", 2) == 0) {
+    if (strncmp(str, "0x", 2) == 0 || strncmp(str, "0X", 2) == 0) {
         char *end;
-        long v = strtol(s + 2, &end, 16);
+        long v = strtol(str + 2, &end, 16);
 
         if (*end != '\0') {
             return 0;
         }
 
-        *out = (int)v;
+        *out_value = (int)v;
         return 1;
     }
 
-    if (strncmp(s, "0b", 2) == 0 || strncmp(s, "0B", 2) == 0) {
+    if (strncmp(str, "0b", 2) == 0 || strncmp(str, "0B", 2) == 0) {
         char *end;
-        long v = strtol(s + 2, &end, 2);
+        long v = strtol(str + 2, &end, 2);
 
         if (*end != '\0') {
             return 0;
         }
 
-        *out = (int)v;
+        *out_value = (int)v;
         return 1;
     }
 
     {
         char *end;
-        long v = strtol(s, &end, 10);
+        long v = strtol(str, &end, 10);
         if (*end != '\0') {
             return 0;
         }
 
-        *out = (int)v;
+        *out_value = (int)v;
         return 1;
     }
 }
@@ -1147,65 +1147,65 @@ int parse_number(const char *s, int *out)
  * resolve later in the second pass.
  */
 
-static int set_immediate_operand(const char *s, operand_t *op)
+static int set_immediate_operand(const char *text, operand_t *operand)
 {
-    if (*s != CHAR_HASH) {
+    if (*text != CHAR_HASH) {
         return 0;
     }
 
-    const char *rest = s + 1;
+    const char *rest_after_hash = text + 1;
 
-    int v;
+    int value;
 
-    op->mode = AM_IMMEDIATE;
+    operand->mode = AM_IMMEDIATE;
 
-    if (parse_number(rest, &v)) {
-        op->value = v;
+    if (parse_number(rest_after_hash, &value)) {
+        operand->value = value;
     } else {
-        op->expr = strdup(rest);
+        operand->expr = strdup(rest_after_hash);
     }
 
     return 1;
 }
 
-static int set_accumulator_operand(const char *s, operand_t *op)
+static int set_accumulator_operand(const char *text, operand_t *operand)
 {
-    if (!(strcmp(s, "A") == 0 || strcmp(s, "a") == 0)) {
+    if (!(strcmp(text, "A") == 0 || strcmp(text, "a") == 0)) {
         return 0;
     }
 
-    op->mode = AM_ACCUMULATOR;
+    operand->mode = AM_ACCUMULATOR;
 
     return 1;
 }
 
-static int set_indirect_operand(char *s, operand_t *op)
+static int set_indirect_operand(char *text, operand_t *operand)
 {
-    if (*s != CHAR_LPAREN) {
+    if (*text != CHAR_LPAREN) {
         return 0;
     }
 
-    char *rparen = strrchr(s, ')');
-    if (!rparen) {
-        asm_error(0, "Malformed indirect operand: %s", s);
+    char *right_paren = strrchr(text, ')');
+    if (!right_paren) {
+        asm_error(0, "Malformed indirect operand: %s", text);
     }
 
-    *rparen = '\0';
-    char *inside = s + 1;
-    char *after = trimws(rparen + 1);
+    *right_paren = '\0';
+    char *inside_parens = text + 1;
+    char *after = trimws(right_paren + 1);
 
     /* (expr),Y */
     if (*after == ',') {
-        char *p = trimws(after + 1);
+        char *reg_text = trimws(after + 1);
 
-        if (toupper((unsigned char)*p) == 'Y') {
-            int v;
-            op->mode = AM_INDIRECT_Y;
+        if (toupper((unsigned char)*reg_text) == 'Y') {
+            int value;
+            operand->mode = AM_INDIRECT_Y;
 
-            if (parse_number(inside, &v)) {
-                op->value = v;
+            if (parse_number(inside_parens, &value)) {
+                operand->value = value;
             } else {
-                op->expr = strdup(inside);
+                operand->expr = strdup(inside_parens);
             }
 
             return 1;
@@ -1213,20 +1213,20 @@ static int set_indirect_operand(char *s, operand_t *op)
     }
 
     /* (expr,X) */
-    char *comma_in = strchr(inside, CHAR_COMMA);
-    if (comma_in) {
-        *comma_in = '\0';
-        char *base = trimws(inside);
-        char *p = trimws(comma_in + 1);
+    char *comma_inside = strchr(inside_parens, CHAR_COMMA);
+    if (comma_inside) {
+        *comma_inside = '\0';
+        char *base = trimws(inside_parens);
+        char *reg_text = trimws(comma_inside + 1);
 
-        if (toupper((unsigned char)*p) == 'X') {
-            int v;
-            op->mode = AM_INDIRECT_X;
+        if (toupper((unsigned char)*reg_text) == 'X') {
+            int value;
+            operand->mode = AM_INDIRECT_X;
 
-            if (parse_number(base, &v)) {
-                op->value = v;
+            if (parse_number(base, &value)) {
+                operand->value = value;
             } else {
-                op->expr = strdup(base);
+                operand->expr = strdup(base);
             }
 
             return 1;
@@ -1234,101 +1234,101 @@ static int set_indirect_operand(char *s, operand_t *op)
     }
 
     /* pure (expr) */
-    int v;
-    op->mode = AM_INDIRECT;
-    if (parse_number(inside, &v)) {
-        op->value = v;
+    int value;
+    operand->mode = AM_INDIRECT;
+    if (parse_number(inside_parens, &value)) {
+        operand->value = value;
     } else {
-        op->expr = strdup(inside);
+        operand->expr = strdup(inside_parens);
     }
 
     return 1;
 }
 
-static int set_indexed_operand(char *s, operand_t *op, const char *orig)
+static int set_indexed_operand(char *text, operand_t *operand, const char *original_text)
 {
-    char *comma = strchr(s, CHAR_COMMA);
+    char *comma = strchr(text, CHAR_COMMA);
     if (!comma) {
         return 0;
     }
 
     *comma = '\0';
-    char *base = trimws(s);
-    char *p = trimws(comma + 1);
-    char reg = toupper((unsigned char)*p);
+    char *base = trimws(text);
+    char *reg_text = trimws(comma + 1);
+    char reg = toupper((unsigned char)*reg_text);
 
-    int v;
+    int value;
 
-    if (parse_number(base, &v)) {
+    if (parse_number(base, &value)) {
         if (reg == 'X') {
-            op->mode = (v <= BYTE_MAX) ? AM_ZEROPAGE_X : AM_ABSOLUTE_X;
-            op->value = v;
+            operand->mode = (value <= BYTE_MAX) ? AM_ZEROPAGE_X : AM_ABSOLUTE_X;
+            operand->value = value;
         } else if (reg == 'Y') {
-            op->mode = (v <= BYTE_MAX) ? AM_ZEROPAGE_Y : AM_ABSOLUTE_Y;
-            op->value = v;
+            operand->mode = (value <= BYTE_MAX) ? AM_ZEROPAGE_Y : AM_ABSOLUTE_Y;
+            operand->value = value;
         } else {
-            asm_error(0, "Unknown suffix register %c in %s", reg, orig);
+            asm_error(0, "Unknown suffix register %c in %s", reg, original_text);
         }
     } else {
         if (reg == 'X') {
-            op->mode = AM_ABSOLUTE_X;
+            operand->mode = AM_ABSOLUTE_X;
         } else if (reg == 'Y') {
-            op->mode = AM_ABSOLUTE_Y;
+            operand->mode = AM_ABSOLUTE_Y;
         }
 
-        op->expr = strdup(base);
+        operand->expr = strdup(base);
     }
 
     return 1;
 }
 
-operand_t parse_operand(const char *s0)
+operand_t parse_operand(const char *operand_text)
 {
-    operand_t op;
-    op.mode = AM_NONE;
-    op.value = 0;
-    op.expr = NULL;
+    operand_t operand;
+    operand.mode = AM_NONE;
+    operand.value = 0;
+    operand.expr = NULL;
 
-    if (!s0) {
-        return op;
+    if (!operand_text) {
+        return operand;
     }
 
     char buf[STRING_BUF];
-    strncpy(buf, s0, sizeof(buf) - 1);
+    strncpy(buf, operand_text, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    char *s = trimws(buf);
-    if (*s == '\0') {
-        return op;
+    char *trimmed = trimws(buf);
+    if (*trimmed == '\0') {
+        return operand;
     }
 
-    if (set_immediate_operand(s, &op)) {
-        return op;
+    if (set_immediate_operand(trimmed, &operand)) {
+        return operand;
     }
 
-    if (set_accumulator_operand(s, &op)) {
-        return op;
+    if (set_accumulator_operand(trimmed, &operand)) {
+        return operand;
     }
 
-    if (set_indirect_operand(s, &op)) {
-        return op;
+    if (set_indirect_operand(trimmed, &operand)) {
+        return operand;
     }
 
-    if (set_indexed_operand(s, &op, s0)) {
-        return op;
+    if (set_indexed_operand(trimmed, &operand, operand_text)) {
+        return operand;
     }
 
     /* Fallback: direct value or label */
-    int v;
-    if (parse_number(s, &v)) {
-        op.mode = (v <= BYTE_MAX) ? AM_ZEROPAGE : AM_ABSOLUTE;
-        op.value = v;
+    int value;
+    if (parse_number(trimmed, &value)) {
+        operand.mode = (value <= BYTE_MAX) ? AM_ZEROPAGE : AM_ABSOLUTE;
+        operand.value = value;
     } else {
-        op.mode = AM_ABSOLUTE;
-        op.expr = strdup(s);
+        operand.mode = AM_ABSOLUTE;
+        operand.expr = strdup(trimmed);
     }
 
-    return op;
+    return operand;
 }
 
 /* Parse one line of source into an asm_line_t structure.
@@ -1353,31 +1353,31 @@ int sym_lookup(const char *name)
 }
 
 /* Scoped symbol lookup: prefer nearest (highest) scope <= depth; fall back to global defines */
-static int sym_lookup_scoped(const char *name, int depth)
+static int sym_lookup_scoped(const char *symbol_name, int scope_depth_limit)
 {
-    int best_idx = -1;
+    int best_index = -1;
     int best_scope = -1;
 
     for (int i = 0; i < sym_count; i++) {
-        if (strcmp(symtab[i].name, name) == 0 && symtab[i].is_label) {
-            int sd = symtab[i].scope_depth;
+        if (strcmp(symtab[i].name, symbol_name) == 0 && symtab[i].is_label) {
+            int symbol_scope = symtab[i].scope_depth;
 
-            if (sd <= depth && sd >= 0) {
-                if (sd > best_scope) {
-                    best_scope = sd;
-                    best_idx = i;
+            if (symbol_scope <= scope_depth_limit && symbol_scope >= 0) {
+                if (symbol_scope > best_scope) {
+                    best_scope = symbol_scope;
+                    best_index = i;
                 }
             }
         }
     }
 
-    if (best_idx >= 0) {
-        return symtab[best_idx].addr;
+    if (best_index >= 0) {
+        return symtab[best_index].addr;
     }
 
     /* fall back to defines (treated as global) */
     for (int i = 0; i < sym_count; i++) {
-        if (strcmp(symtab[i].name, name) == 0 && !symtab[i].is_label) {
+        if (strcmp(symtab[i].name, symbol_name) == 0 && !symtab[i].is_label) {
             return symtab[i].addr;
         }
     }
@@ -1429,191 +1429,191 @@ static void sym_add_scoped(const char *name, int addr, int scope_depth_in, int i
  * Returns 1 on success and stores value in *out, else 0.
  */
 
-static const char *expr_skip_ws(const char *p)
+static const char *expr_skip_ws(const char *cursor)
 {
-    while (*p && isspace((unsigned char)*p)) {
-        p++;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
     }
 
-    return p;
+    return cursor;
 }
 
-static int eval_parse_token(const char **pp, char *buf, int bufsz)
+static int eval_parse_token(const char **pcur, char *token_buf, int token_bufsz)
 {
     /* Parse a token that is not an operator or parenthesis. */
-    const char *p = expr_skip_ws(*pp);
-    int i = 0;
+    const char *cursor = expr_skip_ws(*pcur);
+    int out_len = 0;
 
-    while (*p && !isspace((unsigned char)*p)) {
-        char c = *p;
+    while (*cursor && !isspace((unsigned char)*cursor)) {
+        char c = *cursor;
         if (c == '+' || c == '-' || c == '*' || c == '/' || c == '(' || c == ')') {
             break;
         }
 
-        if (i < bufsz - 1) {
-            buf[i++] = c;
+        if (out_len < token_bufsz - 1) {
+            token_buf[out_len++] = c;
         }
 
-        p++;
+        cursor++;
     }
 
-    buf[i] = '\0';
-    *pp = p;
+    token_buf[out_len] = '\0';
+    *pcur = cursor;
 
-    return i > 0;
+    return out_len > 0;
 }
 
-static int eval_parse_factor(const char **pp, int *out)
+static int eval_parse_factor(const char **pcur, int *out_value)
 {
-    const char *p = expr_skip_ws(*pp);
+    const char *cursor = expr_skip_ws(*pcur);
 
     int sign = +1;
 
-    if (*p == '+') {
-        p++;
-        p = expr_skip_ws(p);
-    } else if (*p == '-') {
+    if (*cursor == '+') {
+        cursor++;
+        cursor = expr_skip_ws(cursor);
+    } else if (*cursor == '-') {
         sign = -1;
-        p++;
-        p = expr_skip_ws(p);
+        cursor++;
+        cursor = expr_skip_ws(cursor);
     }
 
     /* Low/high byte operators: '<expr' (lo), '>expr' (hi) */
-    if (*p == '<' || *p == '>') {
-        char op = *p++;
-        int vsub;
+    if (*cursor == '<' || *cursor == '>') {
+        char op = *cursor++;
+        int sub_value;
 
-        if (!eval_parse_factor(&p, &vsub)) {
+        if (!eval_parse_factor(&cursor, &sub_value)) {
             return 0;
         }
 
-        int v = (op == '<') ? (vsub & 0xFF) : ((vsub >> 8) & 0xFF);
-        *pp = p;
-        *out = sign * v;
+        int v = (op == '<') ? (sub_value & 0xFF) : ((sub_value >> 8) & 0xFF);
+        *pcur = cursor;
+        *out_value = sign * v;
         return 1;
     }
 
-    if (*p == '(') {
-        p++;
+    if (*cursor == '(') {
+        cursor++;
 
-        if (!eval_parse_expr(&p, out)) {
+        if (!eval_parse_expr(&cursor, out_value)) {
             return 0;
         }
 
-        p = expr_skip_ws(p);
-        if (*p != ')') {
+        cursor = expr_skip_ws(cursor);
+        if (*cursor != ')') {
             return 0;
         }
 
-        p++;
-        *pp = p;
-        *out = sign * (*out);
+        cursor++;
+        *pcur = cursor;
+        *out_value = sign * (*out_value);
         return 1;
     } else {
         /* Support current PC symbol '*' at factor position */
-        if (*p == '*') {
-            p++;
-            *pp = p;
-            *out = sign * g_eval_pc;
+        if (*cursor == '*') {
+            cursor++;
+            *pcur = cursor;
+            *out_value = sign * g_eval_pc;
             return 1;
         }
 
         char tok[STRING_BUF];
-        if (!eval_parse_token(&p, tok, sizeof(tok))) {
+        if (!eval_parse_token(&cursor, tok, sizeof(tok))) {
             return 0;
         }
 
-        int v;
-        if (parse_number(tok, &v)) {
-            *out = sign * v;
-            *pp = p;
+        int literal_value;
+        if (parse_number(tok, &literal_value)) {
+            *out_value = sign * literal_value;
+            *pcur = cursor;
             return 1;
         }
 
-        int s = sym_lookup_scoped(tok, current_scope_depth);
-        if (s < 0) {
+        int symbol_addr = sym_lookup_scoped(tok, current_scope_depth);
+        if (symbol_addr < 0) {
             return 0;
         }
 
-        *out = sign * s;
-        *pp = p;
+        *out_value = sign * symbol_addr;
+        *pcur = cursor;
         return 1;
     }
 }
 
-static int eval_parse_term(const char **pp, int *out)
+static int eval_parse_term(const char **pcur, int *out_value)
 {
-    if (!eval_parse_factor(pp, out)) {
+    if (!eval_parse_factor(pcur, out_value)) {
         return 0;
     }
 
-    const char *p = expr_skip_ws(*pp);
+    const char *cursor = expr_skip_ws(*pcur);
 
-    while (*p == '*' || *p == '/') {
-        char op = *p++;
+    while (*cursor == '*' || *cursor == '/') {
+        char op = *cursor++;
         int rhs;
 
-        if (!eval_parse_factor(&p, &rhs)) {
+        if (!eval_parse_factor(&cursor, &rhs)) {
             return 0;
         }
 
         if (op == '*') {
-            *out = (*out) * rhs;
+            *out_value = (*out_value) * rhs;
         } else {
             if (rhs == 0) {
                 return 0; /* division by zero */
             }
 
-            *out = (*out) / rhs;
+            *out_value = (*out_value) / rhs;
         }
 
-        p = expr_skip_ws(p);
+        cursor = expr_skip_ws(cursor);
     }
 
-    *pp = p;
+    *pcur = cursor;
 
     return 1;
 }
 
-static int eval_parse_expr(const char **pp, int *out)
+static int eval_parse_expr(const char **pcur, int *out_value)
 {
-    if (!eval_parse_term(pp, out)) {
+    if (!eval_parse_term(pcur, out_value)) {
         return 0;
     }
 
-    const char *p = expr_skip_ws(*pp);
+    const char *cursor = expr_skip_ws(*pcur);
 
-    while (*p == '+' || *p == '-') {
-        char op = *p++;
+    while (*cursor == '+' || *cursor == '-') {
+        char op = *cursor++;
         int rhs;
 
-        if (!eval_parse_term(&p, &rhs)) {
+        if (!eval_parse_term(&cursor, &rhs)) {
             return 0;
         }
 
         if (op == '+') {
-            *out = (*out) + rhs;
+            *out_value = (*out_value) + rhs;
         } else {
-            *out = (*out) - rhs;
+            *out_value = (*out_value) - rhs;
         }
 
-        p = expr_skip_ws(p);
+        cursor = expr_skip_ws(cursor);
     }
 
-    *pp = p;
-
+    *pcur = cursor;
+    
     return 1;
 }
 
-int eval_expr(const char *expr, int *out) {
-    const char *p = expr;
+int eval_expr(const char *expr, int *out_value) {
+    const char *cursor = expr;
 
-    if (!eval_parse_expr(&p, out)) {
+    if (!eval_parse_expr(&cursor, out_value)) {
         return 0;
     }
 
-    p = expr_skip_ws(p);
-    if (*p != '\0') {
+    cursor = expr_skip_ws(cursor);
+    if (*cursor != '\0') {
         /* Trailing junk */
         return 0;
     }
@@ -1941,22 +1941,22 @@ static int count_csv_items(const char *s)
     return cnt;
 }
 
-static void first_handle_org(const asm_line_t *ln, int *pc)
+static void first_handle_org(const asm_line_t *line, int *program_counter)
 {
-    *pc = parse_org_value_file(ln->filename, ln->extra, ln->lineno, *pc);
+    *program_counter = parse_org_value_file(line->filename, line->extra, line->lineno, *program_counter);
 
-    DEBUG_PRINT("ORG: 0x%04x\n", *pc);
+    DEBUG_PRINT("ORG: 0x%04x\n", *program_counter);
 }
 
-static void first_handle_incbin(const asm_line_t *ln, int *pc)
+static void first_handle_incbin(const asm_line_t *line, int *program_counter)
 {
-    if (!ln->extra) {
-        asm_error_file(ln->filename, ln->lineno, "Missing filename for .incbin");
+    if (!line->extra) {
+        asm_error_file(line->filename, line->lineno, "Missing filename for .incbin");
     }
 
     char fnbuf[STRING_BUF];
 
-    strncpy(fnbuf, ln->extra, sizeof(fnbuf) - 1);
+    strncpy(fnbuf, line->extra, sizeof(fnbuf) - 1);
     fnbuf[sizeof(fnbuf) - 1] = '\0';
 
     char *fn = trimws(fnbuf);
@@ -1971,71 +1971,90 @@ static void first_handle_incbin(const asm_line_t *ln, int *pc)
 
     FILE *f = fopen(fn, "rb");
     if (!f) {
-        asm_error_file(ln->filename, ln->lineno, "Cannot open .incbin file: %s", fn);
+        asm_error_file(line->filename, line->lineno, "Cannot open .incbin file: %s", fn);
     }
 
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fclose(f);
 
-    DEBUG_PRINT(".incbin: %s at 0x%04x, len: %d\n", fn, *pc, (int)sz);
+    DEBUG_PRINT(".incbin: %s at 0x%04x, len: %d\n", fn, *program_counter, (int)sz);
 
-    *pc += (int)sz;
-}
-
-static void first_handle_byte(const asm_line_t *ln, int *pc)
-{
-    if (!ln->extra) {
-        asm_error_file(ln->filename, ln->lineno, "Missing data in .byte");
+    /* Early size check to ensure included bytes will fit in output buffer. */
+    if (*program_counter + (int)sz > MAX_OUTPUT) {
+        asm_error_file(line->filename, line->lineno, ".incbin would exceed output buffer (size %ld at PC $%04X)", sz, *program_counter & 0xFFFF);
     }
 
-    *pc += count_csv_items(ln->extra);
+    *program_counter += (int)sz;
 }
 
-static void first_handle_word(const asm_line_t *ln, int *pc)
+static void first_handle_byte(const asm_line_t *line, int *program_counter)
 {
-    if (!ln->extra) {
-        asm_error_file(ln->filename, ln->lineno, "Missing data in .word");
+    if (!line->extra) {
+        asm_error_file(line->filename, line->lineno, "Missing data in .byte");
     }
 
-    *pc += 2 * count_csv_items(ln->extra);
+    int count = count_csv_items(line->extra);
+    if (*program_counter + count > MAX_OUTPUT) {
+        asm_error_file(line->filename, line->lineno, ".byte would exceed output buffer (count %d at PC $%04X)", count, *program_counter & 0xFFFF);
+    }
+
+    *program_counter += count;
+}
+
+static void first_handle_word(const asm_line_t *line, int *program_counter)
+{
+    if (!line->extra) {
+        asm_error_file(line->filename, line->lineno, "Missing data in .word");
+    }
+
+    int count = 2 * count_csv_items(line->extra);
+    if (*program_counter + count > MAX_OUTPUT) {
+        asm_error_file(line->filename, line->lineno, ".word would exceed output buffer (count %d at PC $%04X)", count, *program_counter & 0xFFFF);
+    }
+
+    *program_counter += count;
 }
 
 /* .fill <size>, <value> : advance PC by <size> in first pass */
-static void first_handle_fill(const asm_line_t *ln, int *pc)
+static void first_handle_fill(const asm_line_t *line, int *program_counter)
 {
-    if (!ln->extra) {
-        asm_error_file(ln->filename, ln->lineno, "Missing arguments for .fill (expected: size, value)");
+    if (!line->extra) {
+        asm_error_file(line->filename, line->lineno, "Missing arguments for .fill (expected: size, value)");
     }
 
     char buf[MAX_LINE_LEN];
-    strncpy(buf, ln->extra, sizeof(buf) - 1);
+    strncpy(buf, line->extra, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     char *comma = strchr(buf, ',');
     if (!comma) {
-        asm_error_file(ln->filename, ln->lineno, "Malformed .fill, expected: .fill <size>, <value>");
+        asm_error_file(line->filename, line->lineno, "Malformed .fill, expected: .fill <size>, <value>");
     }
 
     *comma = '\0';
     char *size_tok = trimws(buf);
     int size_val;
 
-    g_eval_pc = *pc;
+    g_eval_pc = *program_counter;
     if (!(parse_number(size_tok, &size_val) || eval_expr(size_tok, &size_val))) {
         /* try symbol lookup of bare name */
         int s = sym_lookup_scoped(size_tok, current_scope_depth);
         if (s < 0) {
-            asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill size: %s", ln->extra);
+            asm_error_file(line->filename, line->lineno, "Unable to resolve .fill size: %s", line->extra);
         }
         size_val = s;
     }
 
     if (size_val < 0) {
-        asm_error_file(ln->filename, ln->lineno, ".fill size must be non-negative: %d", size_val);
+        asm_error_file(line->filename, line->lineno, ".fill size must be non-negative: %d", size_val);
     }
 
-    *pc += size_val;
+    if (*program_counter + size_val > MAX_OUTPUT) {
+        asm_error_file(line->filename, line->lineno, ".fill would exceed output buffer (size %d at PC $%04X)", size_val, *program_counter & 0xFFFF);
+    }
+
+    *program_counter += size_val;
 }
 
 /* Extracts the payload of a .text directive as a newly allocated C string.
@@ -2067,48 +2086,48 @@ static char *extract_text_payload_alloc(const asm_line_t *ln)
     return strdup(t);
 }
 
-static void first_handle_text(const asm_line_t *ln, int *pc)
+static void first_handle_text(const asm_line_t *line, int *program_counter)
 {
-    char *text = extract_text_payload_alloc(ln);
-    *pc += (int)strlen(text);
+    char *text = extract_text_payload_alloc(line);
+    *program_counter += (int)strlen(text);
     free(text);
 }
 
-static void first_handle_instruction(const asm_line_t *ln, int *pc)
+static void first_handle_instruction(const asm_line_t *line, int *program_counter)
 {
-    const opcode_t *op = opcode_lookup(ln->mnemonic, ln->op.mode);
+    const opcode_t *op = opcode_lookup(line->mnemonic, line->op.mode);
 
-    /* Fallback: if ZEROPAGE,Y isn't supported for this mnemonic, try ABSOLUTE,Y. */
-    if (!op && ln->op.mode == AM_ZEROPAGE_Y) {
-        const opcode_t *alt = opcode_lookup(ln->mnemonic, AM_ABSOLUTE_Y);
+    /* Addressing mode fallback: if ZEROPAGE,Y is unsupported for this mnemonic, try ABSOLUTE,Y. */
+    if (!op && line->op.mode == AM_ZEROPAGE_Y) {
+        const opcode_t *alt = opcode_lookup(line->mnemonic, AM_ABSOLUTE_Y);
         if (alt) {
             /* Mutate the parsed mode so pass 2 uses the same */
-            ((asm_line_t *)ln)->op.mode = AM_ABSOLUTE_Y;
+            ((asm_line_t *)line)->op.mode = AM_ABSOLUTE_Y;
             op = alt;
         }
     }
 
     if (!op) {
-        asm_error_file(ln->filename, ln->lineno, "%s does not support %s addressing",
-                ln->mnemonic, addrmode_str(ln->op.mode));
+        asm_error_file(line->filename, line->lineno, "%s does not support %s addressing",
+                line->mnemonic, addrmode_str(line->op.mode));
     }
 
-    *pc += op->length;
+    *program_counter += op->length;
 }
 
-static void first_handle_define(const asm_line_t *ln, int *pc)
+static void first_handle_define(const asm_line_t *line, int *program_counter)
 {
-    (void)pc; /* PC does not change for a define */
+    (void)program_counter; /* PC does not change for a define */
 
-    if (!ln->def_name || !ln->def_expr) {
-        asm_error_file(ln->filename, ln->lineno, "Malformed define");
+    if (!line->def_name || !line->def_expr) {
+        asm_error_file(line->filename, line->lineno, "Malformed define");
     }
 
-    int v;
-    g_eval_pc = *pc;
+    int value;
+    g_eval_pc = *program_counter;
 
     /* Accept an optional leading '#' as in immediate syntax (e.g., NAME = #$10) */
-    const char *def_expr = ln->def_expr;
+    const char *def_expr = line->def_expr;
     if (def_expr[0] == '#') {
         def_expr++; /* skip immediate marker */
 
@@ -2117,17 +2136,17 @@ static void first_handle_define(const asm_line_t *ln, int *pc)
         }
     }
 
-    if (!(parse_number(def_expr, &v) || eval_expr(def_expr, &v))) {
+    if (!(parse_number(def_expr, &value) || eval_expr(def_expr, &value))) {
         /* Try symbol lookup if it's a bare name */
         int s = sym_lookup_scoped(def_expr, current_scope_depth);
         if (s < 0) {
-            asm_error_file(ln->filename, ln->lineno, "Bad expression in define: %s = %s",
-                      ln->def_name, ln->def_expr);
+            asm_error_file(line->filename, line->lineno, "Bad expression in define: %s = %s",
+                      line->def_name, line->def_expr);
         }
-        v = s;
+        value = s;
     }
 
-    sym_add_scoped(ln->def_name, v, 0, 0, ln->filename, ln->lineno);
+    sym_add_scoped(line->def_name, value, 0, 0, line->filename, line->lineno);
 }
 
 /* FIRST PASS: Assign addresses (PC) and build symbol table. */
@@ -2150,6 +2169,7 @@ void first_pass(void)
             continue;
         }
 
+        /* Record scope depth for this source line to resolve labels consistently across passes */
         line_scope_depth[i] = scope_depth;
         current_scope_depth = scope_depth;
 
@@ -2219,7 +2239,7 @@ void first_pass(void)
                 break;
 
             case DIR_BLOCK_START:
-                /* Increase scope depth AFTER this line so labels on this line are outer */
+                /* Enter a new lexical scope AFTER this line so labels on this line remain in the outer scope */
                 scope_depth++;
                 current_scope_depth = scope_depth;
                 break;
@@ -2229,6 +2249,7 @@ void first_pass(void)
                     asm_error_file(ln->filename, ln->lineno, ".bend without matching .block");
                 }
 
+                /* Exit current lexical scope */
                 scope_depth--;
                 current_scope_depth = scope_depth;
                 break;
@@ -2239,109 +2260,114 @@ void first_pass(void)
         }
     }
 
+    /* Final sanity: ensure first pass PC never exceeded output buffer. */
+    if (pc > MAX_OUTPUT) {
+        asm_error(0, "Assembly size exceeds output buffer limit (%d bytes)", MAX_OUTPUT);
+    }
+
     if (scope_depth != 0) {
         asm_error(0, "Unterminated .block (missing .bend)");
     }
 }
 
 /* Emit a single byte into the output buffer at absolute PC. */
-void emit_byte(int pc, uint8_t b)
+void emit_byte(int program_counter, uint8_t byte_value)
 {
-    if (pc < 0 || pc >= MAX_OUTPUT) {
-        asm_error(0, "Output PC out of range: %04X", pc);
+    if (program_counter < 0 || program_counter >= MAX_OUTPUT) {
+        asm_error(0, "Output PC out of range: %04X", program_counter);
     }
 
-    outbuf[pc] = b;
+    outbuf[program_counter] = byte_value;
 
-    if (pc < out_lo) {
-        out_lo = pc;
+    if (program_counter < out_lo) {
+        out_lo = program_counter;
     }
 
-    if (pc > out_hi) {
-        out_hi = pc;
+    if (program_counter > out_hi) {
+        out_hi = program_counter;
     }
 
-    DEBUG_PRINT("EMIT: 0x%04x : 0x%02x\n", pc, b);
+    DEBUG_PRINT("EMIT: 0x%04x : 0x%02x\n", program_counter, byte_value);
 }
 
 /* Emit a 16-bit little-endian word at absolute PC. */
-void emit_word(int pc, int v)
+void emit_word(int program_counter, int value)
 {
-    emit_byte(pc, LOBYTE(v));
-    emit_byte(pc + 1, HIBYTE(v));
+    emit_byte(program_counter, LOBYTE(value));
+    emit_byte(program_counter + 1, HIBYTE(value));
 }
 
 /* ---- Helpers to flatten second pass emission ---- */
-static int resolve_value_from_expr(const char *expr,
-                                   int pc,
+static int resolve_value_from_expr(const char *expr_text,
+                                   int program_counter,
                                    int line_index,
-                                   const char *file,
-                                   int lineno,
-                                   int *out)
+                                   const char *source_file,
+                                   int source_line,
+                                   int *out_value)
 {
-    char kind;
-    int n;
+    char local_ref_kind;
+    int local_ref_count;
 
-    if (parse_local_ref(expr, &kind, &n)) {
-        int addr;
+    if (parse_local_ref(expr_text, &local_ref_kind, &local_ref_count)) {
+        int resolved_addr;
 
-        if (kind == '-') {
-            if (!resolve_minus_addr_k(line_index, n, &addr)) {
-                asm_error_file(file, lineno, "No matching '-' label found");
+        if (local_ref_kind == '-') {
+            if (!resolve_minus_addr_k(line_index, local_ref_count, &resolved_addr)) {
+                asm_error_file(source_file, source_line, "No matching '-' label found");
             }
         } else {
-            if (!resolve_plus_addr_k(line_index, n, &addr)) {
-                asm_error_file(file, lineno, "No matching '+' label found");
+            if (!resolve_plus_addr_k(line_index, local_ref_count, &resolved_addr)) {
+                asm_error_file(source_file, source_line, "No matching '+' label found");
             }
         }
 
-        *out = addr;
+        *out_value = resolved_addr;
         return 1;
     }
 
-    g_eval_pc = pc;
+    g_eval_pc = program_counter;
     current_scope_depth = (line_index >= 0 && line_index < MAX_LINES) ? line_scope_depth[line_index] : 0;
 
-    if (eval_expr(expr, out) || parse_number(expr, out)) {
+    if (eval_expr(expr_text, out_value) || parse_number(expr_text, out_value)) {
         return 1;
     }
 
-    int s = sym_lookup_scoped(expr, current_scope_depth);
-    if (s < 0) {
-        asm_error_file(file, lineno, "Undefined label %s", expr);
+    int sym_addr = sym_lookup_scoped(expr_text, current_scope_depth);
+    if (sym_addr < 0) {
+        asm_error_file(source_file, source_line, "Undefined label %s", expr_text);
     }
 
-    *out = s;
+    *out_value = sym_addr;
 
     return 1;
 }
 
-static int resolve_operand_value_for_line(const asm_line_t *ln,
-                                          int pc,
+static int resolve_operand_value_for_line(const asm_line_t *line,
+                                          int program_counter,
                                           int line_index,
-                                          int *out)
+                                          int *out_value)
 {
-    if (ln->op.expr) {
-        return resolve_value_from_expr(ln->op.expr, pc, line_index, ln->filename, ln->lineno, out);
+    if (line->op.expr) {
+        return resolve_value_from_expr(line->op.expr, program_counter, line_index, line->filename, line->lineno, out_value);
     }
 
-    *out = ln->op.value;
+    *out_value = line->op.value;
 
     return 1;
 }
 
-static void second_handle_org(const asm_line_t *ln, int *pc)
+static void second_handle_org(const asm_line_t *line, int *program_counter)
 {
-    *pc = parse_org_value(ln->extra, ln->lineno, *pc);
+    *program_counter = parse_org_value(line->extra, line->lineno, *program_counter);
 
-    DEBUG_PRINT("ORG: 0x%04x\n", *pc);
+    DEBUG_PRINT("ORG: 0x%04x\n", *program_counter);
 }
 
-static void second_handle_incbin(const asm_line_t *ln, int *pc)
+static void second_handle_incbin(const asm_line_t *line, int *program_counter)
 {
     char fnbuf[STRING_BUF];
 
-    strncpy(fnbuf, ln->extra ? ln->extra : "", sizeof(fnbuf) - 1);
+    strncpy(fnbuf, line->extra ? line->extra : "", sizeof(fnbuf) - 1);
     fnbuf[sizeof(fnbuf) - 1] = '\0';
 
     char *fn = trimws(fnbuf);
@@ -2356,97 +2382,97 @@ static void second_handle_incbin(const asm_line_t *ln, int *pc)
 
     FILE *f = fopen(fn, "rb");
     if (!f) {
-        asm_error_file(ln->filename, ln->lineno, "Cannot open .incbin file (second pass): %s", fn);
+        asm_error_file(line->filename, line->lineno, "Cannot open .incbin file (second pass): %s", fn);
     }
 
     int c;
 
-    DEBUG_PRINT(".incbin: %s at 0x%04x\n", fn, *pc);
+    DEBUG_PRINT(".incbin: %s at 0x%04x\n", fn, *program_counter);
 
     while ((c = fgetc(f)) != EOF) {
-        emit_byte(*pc, (uint8_t)c);
-        (*pc)++;
+        emit_byte(*program_counter, (uint8_t)c);
+        (*program_counter)++;
     }
 
     fclose(f);
 }
 
-static void second_handle_byte(const asm_line_t *ln, int *pc)
+static void second_handle_byte(const asm_line_t *line, int *program_counter)
 {
-    char *cp = strdup(ln->extra ? ln->extra : "");
+    char *cp = strdup(line->extra ? line->extra : "");
     char *tok = strtok(cp, ",");
 
     while (tok) {
         char *t = trimws(tok);
-        int v;
+        int value;
 
-        if (!resolve_value_from_expr(t, *pc, current_line_index, ln->filename, ln->lineno, &v)) {
-            asm_error_file(ln->filename, ln->lineno, "Failed to resolve .byte value");
+        if (!resolve_value_from_expr(t, *program_counter, current_line_index, line->filename, line->lineno, &value)) {
+            asm_error_file(line->filename, line->lineno, "Failed to resolve .byte value");
         }
 
-        if (v < 0 || v > BYTE_MAX) {
-            asm_error_file(ln->filename, ln->lineno, ".byte value %d out of 8-bit range", v);
+        if (value < 0 || value > BYTE_MAX) {
+            asm_error_file(line->filename, line->lineno, ".byte value %d out of 8-bit range", value);
         }
 
-        emit_byte(*pc, (uint8_t)v);
-        (*pc)++;
+        emit_byte(*program_counter, (uint8_t)value);
+        (*program_counter)++;
         tok = strtok(NULL, ",");
     }
 
     free(cp);
 }
 
-static void second_handle_word(const asm_line_t *ln, int *pc)
+static void second_handle_word(const asm_line_t *line, int *program_counter)
 {
-    char *cp = strdup(ln->extra ? ln->extra : "");
+    char *cp = strdup(line->extra ? line->extra : "");
     char *tok = strtok(cp, ",");
 
     while (tok) {
         char *t = trimws(tok);
-        int v;
+        int value;
 
-        if (!resolve_value_from_expr(t, *pc, current_line_index, ln->filename, ln->lineno, &v)) {
-            asm_error_file(ln->filename, ln->lineno, "Failed to resolve .word value");
+        if (!resolve_value_from_expr(t, *program_counter, current_line_index, line->filename, line->lineno, &value)) {
+            asm_error_file(line->filename, line->lineno, "Failed to resolve .word value");
         }
 
-        if (v < 0 || v > WORD_MAX) {
-            asm_error_file(ln->filename, ln->lineno, ".word value %d out of 16-bit range", v);
+        if (value < 0 || value > WORD_MAX) {
+            asm_error_file(line->filename, line->lineno, ".word value %d out of 16-bit range", value);
         }
 
-        emit_word(*pc, v);
-        (*pc) += 2;
+        emit_word(*program_counter, value);
+        (*program_counter) += 2;
         tok = strtok(NULL, ",");
     }
 
     free(cp);
 }
 
-static void second_handle_text(const asm_line_t *ln, int *pc)
+static void second_handle_text(const asm_line_t *line, int *program_counter)
 {
-    char *text = extract_text_payload_alloc(ln);
+    char *text = extract_text_payload_alloc(line);
 
     for (char *p = text; *p; ++p) {
-        emit_byte(*pc, (uint8_t)(unsigned char)(*p));
-        (*pc)++;
+        emit_byte(*program_counter, (uint8_t)(unsigned char)(*p));
+        (*program_counter)++;
     }
 
     free(text);
 }
 
 /* .fill <size>, <value> : emit <size> bytes of <value> */
-static void second_handle_fill(const asm_line_t *ln, int *pc)
+static void second_handle_fill(const asm_line_t *line, int *program_counter)
 {
-    if (!ln->extra) {
-        asm_error_file(ln->filename, ln->lineno, "Missing arguments for .fill (expected: size, value)");
+    if (!line->extra) {
+        asm_error_file(line->filename, line->lineno, "Missing arguments for .fill (expected: size, value)");
     }
 
     char buf[MAX_LINE_LEN];
-    strncpy(buf, ln->extra, sizeof(buf) - 1);
+    strncpy(buf, line->extra, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     char *comma = strchr(buf, ',');
     if (!comma) {
-        asm_error_file(ln->filename, ln->lineno, "Malformed .fill, expected: .fill <size>, <value>");
+        asm_error_file(line->filename, line->lineno, "Malformed .fill, expected: .fill <size>, <value>");
     }
 
     *comma = '\0';
@@ -2457,106 +2483,106 @@ static void second_handle_fill(const asm_line_t *ln, int *pc)
     int value;
 
     /* Resolve size via expression parser; require non-negative */
-    g_eval_pc = *pc;
+    g_eval_pc = *program_counter;
     if (!(parse_number(size_tok, &size_val) || eval_expr(size_tok, &size_val))) {
-        if (!resolve_value_from_expr(size_tok, *pc, current_line_index, ln->filename, ln->lineno, &size_val)) {
-            asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill size: %s", ln->extra);
+        if (!resolve_value_from_expr(size_tok, *program_counter, current_line_index, line->filename, line->lineno, &size_val)) {
+            asm_error_file(line->filename, line->lineno, "Unable to resolve .fill size: %s", line->extra);
         }
     }
 
     if (size_val < 0) {
-        asm_error_file(ln->filename, ln->lineno, ".fill size must be non-negative: %d", size_val);
+        asm_error_file(line->filename, line->lineno, ".fill size must be non-negative: %d", size_val);
     }
 
     /* Resolve fill byte value */
-    if (!resolve_value_from_expr(val_tok, *pc, current_line_index, ln->filename, ln->lineno, &value)) {
-        asm_error_file(ln->filename, ln->lineno, "Unable to resolve .fill value: %s", ln->extra);
+    if (!resolve_value_from_expr(val_tok, *program_counter, current_line_index, line->filename, line->lineno, &value)) {
+        asm_error_file(line->filename, line->lineno, "Unable to resolve .fill value: %s", line->extra);
     }
 
     if (value < 0 || value > BYTE_MAX) {
-        asm_error_file(ln->filename, ln->lineno, ".fill value %d out of 8-bit range", value);
+        asm_error_file(line->filename, line->lineno, ".fill value %d out of 8-bit range", value);
     }
 
     for (int i = 0; i < size_val; ++i) {
-        emit_byte(*pc, (uint8_t)value);
-        (*pc)++;
+        emit_byte(*program_counter, (uint8_t)value);
+        (*program_counter)++;
     }
 }
 
-static void second_emit_instruction(const asm_line_t *ln, int *pc)
+static void second_emit_instruction(const asm_line_t *line, int *program_counter)
 {
-    const opcode_t *op = opcode_lookup(ln->mnemonic, ln->op.mode);
+    const opcode_t *op = opcode_lookup(line->mnemonic, line->op.mode);
 
-    /* Fallback: if ZEROPAGE,Y isn't supported for this mnemonic, try ABSOLUTE,Y. */
-    if (!op && ln->op.mode == AM_ZEROPAGE_Y) {
-        const opcode_t *alt = opcode_lookup(ln->mnemonic, AM_ABSOLUTE_Y);
+    /* Addressing mode fallback: if ZEROPAGE,Y is unsupported for this mnemonic, try ABSOLUTE,Y. */
+    if (!op && line->op.mode == AM_ZEROPAGE_Y) {
+        const opcode_t *alt = opcode_lookup(line->mnemonic, AM_ABSOLUTE_Y);
 
         if (alt) {
-            ((asm_line_t *)ln)->op.mode = AM_ABSOLUTE_Y;
+            ((asm_line_t *)line)->op.mode = AM_ABSOLUTE_Y;
             op = alt;
         }
     }
 
     if (!op) {
-        asm_error_file(ln->filename, ln->lineno, "%s does not support %s addressing",
-                ln->mnemonic, addrmode_str(ln->op.mode));
+        asm_error_file(line->filename, line->lineno, "%s does not support %s addressing",
+                line->mnemonic, addrmode_str(line->op.mode));
     }
 
-    emit_byte(*pc, op->opcode);
+    emit_byte(*program_counter, op->opcode);
 
     switch (op->length) {
         case 1:
-            (*pc) += 1;
+            (*program_counter) += 1;
             break;
 
         case 2: {
-            int v;
+            int value;
 
-            if (ln->op.mode == AM_RELATIVE) {
-                if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "Failed to resolve branch target");
+            if (line->op.mode == AM_RELATIVE) {
+                if (!resolve_operand_value_for_line(line, *program_counter, current_line_index, &value)) {
+                    asm_error_file(line->filename, line->lineno, "Failed to resolve branch target");
                 }
 
-                int offset = v - (*pc + 2);
+                int offset = value - (*program_counter + 2);
                 if (offset < BRANCH_MIN || offset > BRANCH_MAX) {
-                    asm_error_file(ln->filename, ln->lineno, "Branch offset out of range: %d", offset);
+                    asm_error_file(line->filename, line->lineno, "Branch offset out of range: %d", offset);
                 }
 
-                emit_byte(*pc + 1, (uint8_t)offset);
+                emit_byte(*program_counter + 1, (uint8_t)offset);
             } else {
-                if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
-                    asm_error_file(ln->filename, ln->lineno, "Failed to resolve operand");
+                if (!resolve_operand_value_for_line(line, *program_counter, current_line_index, &value)) {
+                    asm_error_file(line->filename, line->lineno, "Failed to resolve operand");
                 }
 
-                if (v < 0 || v > BYTE_MAX) {
-                    asm_error_file(ln->filename, ln->lineno, "8-bit operand %d out of range", v);
+                if (value < 0 || value > BYTE_MAX) {
+                    asm_error_file(line->filename, line->lineno, "8-bit operand %d out of range", value);
                 }
 
-                emit_byte(*pc + 1, LOBYTE(v));
+                emit_byte(*program_counter + 1, LOBYTE(value));
             }
 
-            (*pc) += 2;
+            (*program_counter) += 2;
             break;
         }
 
         case 3: {
-            int v;
+            int value;
 
-            if (!resolve_operand_value_for_line(ln, *pc, current_line_index, &v)) {
-                asm_error_file(ln->filename, ln->lineno, "Failed to resolve operand");
+            if (!resolve_operand_value_for_line(line, *program_counter, current_line_index, &value)) {
+                asm_error_file(line->filename, line->lineno, "Failed to resolve operand");
             }
 
-            if (v < 0 || v > WORD_MAX) {
-                asm_error_file(ln->filename, ln->lineno, "16-bit operand %d out of range", v);
+            if (value < 0 || value > WORD_MAX) {
+                asm_error_file(line->filename, line->lineno, "16-bit operand %d out of range", value);
             }
 
-            emit_word(*pc + 1, v);
-            (*pc) += 3;
+            emit_word(*program_counter + 1, value);
+            (*program_counter) += 3;
             break;
         }
 
         default:
-            asm_error_file(ln->filename, ln->lineno, "Invalid opcode length %d", op->length);
+            asm_error_file(line->filename, line->lineno, "Invalid opcode length %d", op->length);
     }
 }
 
@@ -2565,48 +2591,48 @@ void second_pass(void)
 {
     DEBUG_PRINT("Second pass...\n");
 
-    int pc = origin;
+    int program_counter = origin;
 
     for (int i = 0; i < line_count; i++) {
-        asm_line_t *ln = lines[i];
+        asm_line_t *line = lines[i];
         current_line_index = i;
         current_scope_depth = (i >= 0 && i < MAX_LINES) ? line_scope_depth[i] : 0;
 
-        if (!ln || !ln->mnemonic) {
+        if (!line || !line->mnemonic) {
             continue;
         }
 
-        switch (classify_directive(ln)) {
+        switch (classify_directive(line)) {
             case DIR_DEFINE:
                 /* no-op in second pass */
                 break;
 
             case DIR_ORG:
-                second_handle_org(ln, &pc);
+                second_handle_org(line, &program_counter);
                 break;
 
             case DIR_INCBIN:
-                second_handle_incbin(ln, &pc);
+                second_handle_incbin(line, &program_counter);
                 break;
 
             case DIR_BYTE:
-                second_handle_byte(ln, &pc);
+                second_handle_byte(line, &program_counter);
                 break;
 
             case DIR_WORD:
-                second_handle_word(ln, &pc);
+                second_handle_word(line, &program_counter);
                 break;
 
             case DIR_TEXT:
-                second_handle_text(ln, &pc);
+                second_handle_text(line, &program_counter);
                 break;
 
             case DIR_NONE:
-                second_emit_instruction(ln, &pc);
+                second_emit_instruction(line, &program_counter);
                 break;
 
             case DIR_FILL:
-                second_handle_fill(ln, &pc);
+                second_handle_fill(line, &program_counter);
                 break;
 
             case DIR_BLOCK_START:
@@ -2620,12 +2646,12 @@ void second_pass(void)
 /* ---------------- Source parsing ---------------- */
 
 /* Helpers to parse one source line into asm_line_t */
-static void strip_comments_preserving_quotes(char *s)
+static void strip_comments_preserving_quotes(char *line)
 {
     int in_s = 0;
     int in_d = 0;
 
-    for (char *p = s; *p; ++p) {
+    for (char *p = line; *p; ++p) {
         if (*p == '\'' && !in_d) {
             in_s = !in_s;
             continue;
@@ -2643,7 +2669,7 @@ static void strip_comments_preserving_quotes(char *s)
     }
 }
 
-static int label_lhs_is_identifier(const char *s, size_t len)
+static int label_lhs_is_identifier(const char *text, size_t len)
 {
     char leftbuf[STRING_BUF];
 
@@ -2651,7 +2677,7 @@ static int label_lhs_is_identifier(const char *s, size_t len)
         len = sizeof(leftbuf) - 1;
     }
 
-    memcpy(leftbuf, s, len); leftbuf[len] = '\0';
+    memcpy(leftbuf, text, len); leftbuf[len] = '\0';
 
     char *lhs = trimws(leftbuf);
     if (*lhs == '\0') {
@@ -2672,12 +2698,12 @@ static int label_lhs_is_identifier(const char *s, size_t len)
     return 1;
 }
 
-static char *find_valid_label_colon(char *s)
+static char *find_valid_label_colon(char *line)
 {
     int in_s = 0;
     int in_d = 0;
 
-    for (char *p = s; *p; ++p) {
+    for (char *p = line; *p; ++p) {
         if (*p == '\'' && !in_d) {
             in_s = !in_s;
             continue;
@@ -2689,7 +2715,7 @@ static char *find_valid_label_colon(char *s)
         }
 
         if (!in_s && !in_d && *p == ':') {
-            if (label_lhs_is_identifier(s, (size_t)(p - s))) {
+            if (label_lhs_is_identifier(line, (size_t)(p - line))) {
                 return p;
             }
 
@@ -2716,20 +2742,20 @@ static int is_directive_name(const char *t)
            (strcmp(t, "*") == 0);
 }
 
-static int try_parse_define_line(char *s, asm_line_t *ln)
+static int try_parse_define_line(char *line_text, asm_line_t *line)
 {
-    char *eq = strchr(s, '=');
+    char *eq = strchr(line_text, '=');
     if (!eq) {
         return 0;
     }
 
     *eq = '\0';
-    char *lhs = trimws(s);
+    char *lhs = trimws(line_text);
     char *rhs = trimws(eq + 1);
 
     if (strcmp(lhs, "*") == 0) {
-        ln->mnemonic = strdup("*");
-        ln->extra = strdup(rhs);
+        line->mnemonic = strdup("*");
+        line->extra = strdup(rhs);
         return 1;
     }
 
@@ -2746,9 +2772,9 @@ static int try_parse_define_line(char *s, asm_line_t *ln)
     }
 
     if (ok) {
-        ln->def_name = strdup(lhs);
-        ln->def_expr = strdup(rhs);
-        ln->mnemonic = strdup("=");
+        line->def_name = strdup(lhs);
+        line->def_expr = strdup(rhs);
+        line->mnemonic = strdup("=");
         return 1;
     }
 
@@ -2757,13 +2783,13 @@ static int try_parse_define_line(char *s, asm_line_t *ln)
     return 0;
 }
 
-static int maybe_parse_bare_label(char **ps, asm_line_t *ln, int had_colon)
+static int maybe_parse_bare_label(char **pline_text, asm_line_t *line, int had_colon)
 {
     if (had_colon) {
         return 0;
     }
 
-    char *s = *ps;
+    char *s = *pline_text;
     char *ws = s;
 
     while (*ws && !isspace((unsigned char)*ws)) {
@@ -2786,76 +2812,76 @@ static int maybe_parse_bare_label(char **ps, asm_line_t *ln, int had_colon)
     int is_mn = is_mnemonic_name(first_tok);
 
     if (!is_mn && !is_dir) {
-        ln->label = strdup(first_tok);
+        line->label = strdup(first_tok);
 
         if (is_single_token) {
-            *ps = s + strlen(s);
+            *pline_text = s + strlen(s);
             return 1;
         }
 
-        *ps = rest_after;
+        *pline_text = rest_after;
     }
 
     return 0;
 }
 
-asm_line_t *parse_line(const char *in, int lineno)
+asm_line_t *parse_line(const char *input_line, int lineno)
 {
-    char tmp[MAX_LINE_LEN];
+    char line_buf[MAX_LINE_LEN];
 
-    strncpy(tmp, in, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-    char *s = tmp;
+    strncpy(line_buf, input_line, sizeof(line_buf) - 1);
+    line_buf[sizeof(line_buf) - 1] = '\0';
+    char *line_text = line_buf;
 
     /* Strip comments starting at ';', but ignore semicolons inside quotes */
-    strip_comments_preserving_quotes(s);
+    strip_comments_preserving_quotes(line_text);
 
-    s = trimws(s);
-    if (*s == '\0') {
+    line_text = trimws(line_text);
+    if (*line_text == '\0') {
         return NULL; /* blank or comment-only line */
     }
 
-    asm_line_t *ln = calloc(1, sizeof(asm_line_t));
-    ln->lineno = lineno;
-    ln->filename = NULL;
-    ln->label = NULL;
-    ln->mnemonic = NULL;
-    ln->op.mode = AM_NONE;
-    ln->op.expr = NULL;
-    ln->extra = NULL;
-    ln->def_name = NULL;
-    ln->def_expr = NULL;
+    asm_line_t *line = calloc(1, sizeof(asm_line_t));
+    line->lineno = lineno;
+    line->filename = NULL;
+    line->label = NULL;
+    line->mnemonic = NULL;
+    line->op.mode = AM_NONE;
+    line->op.expr = NULL;
+    line->extra = NULL;
+    line->def_name = NULL;
+    line->def_expr = NULL;
 
     /* Label? Find a ':' that is outside quotes and precedes whitespace */
-    char *colon = find_valid_label_colon(s);
+    char *colon_pos = find_valid_label_colon(line_text);
 
-    if (colon) {
-        *colon = '\0';
-        ln->label = strdup(trimws(s));
-        s = trimws(colon + 1);
+    if (colon_pos) {
+        *colon_pos = '\0';
+        line->label = strdup(trimws(line_text));
+        line_text = trimws(colon_pos + 1);
     }
 
-    if (*s == '\0') {
+    if (*line_text == '\0') {
         /* A pure label line like "start:" */
-        return ln;
+        return line;
     }
 
     /* Detect constant define: NAME = EXPR (excluding "* = expr" which is .org) */
-    if (try_parse_define_line(s, ln)) {
-        return ln;
+    if (try_parse_define_line(line_text, line)) {
+        return line;
     }
 
     /* Support label without colon if the entire line is a single token that is
      * NOT a known mnemonic or directive. */
-    if (!colon) {
-        if (maybe_parse_bare_label(&s, ln, 0)) {
-            return ln; /* pure label */
+    if (!colon_pos) {
+        if (maybe_parse_bare_label(&line_text, line, 0)) {
+            return line; /* pure label */
         }
     }
 
     /* mnemonic / directive */
-    char *tok = strtok(s, " \t");
-    ln->mnemonic = strdup(tok);
+    char *mnemonic = strtok(line_text, " \t");
+    line->mnemonic = strdup(mnemonic);
 
     char *rest = strtok(NULL, "");
     if (rest) {
@@ -2863,110 +2889,110 @@ asm_line_t *parse_line(const char *in, int lineno)
     }
 
     /* directives */
-    if ((strcasecmp(ln->mnemonic, ".org") == 0) ||
-        (strcmp(ln->mnemonic, "*") == 0))
+    if ((strcasecmp(line->mnemonic, ".org") == 0) ||
+        (strcmp(line->mnemonic, "*") == 0))
     {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
+        line->extra = rest ? strdup(rest) : NULL;
+        return line;
     }
 
-    if ((strcasecmp(ln->mnemonic, ".incbin") == 0)) {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
+    if ((strcasecmp(line->mnemonic, ".incbin") == 0)) {
+        line->extra = rest ? strdup(rest) : NULL;
+        return line;
     }
 
-    if ((strcasecmp(ln->mnemonic, ".include") == 0))
+    if ((strcasecmp(line->mnemonic, ".include") == 0))
     {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
+        line->extra = rest ? strdup(rest) : NULL;
+        return line;
     }
 
-    if ((strcasecmp(ln->mnemonic, ".byte") == 0) ||
-        (strcasecmp(ln->mnemonic, ".word") == 0) ||
-        (strcasecmp(ln->mnemonic, ".text") == 0) ||
-        (strcasecmp(ln->mnemonic, ".fill") == 0))
+    if ((strcasecmp(line->mnemonic, ".byte") == 0) ||
+        (strcasecmp(line->mnemonic, ".word") == 0) ||
+        (strcasecmp(line->mnemonic, ".text") == 0) ||
+        (strcasecmp(line->mnemonic, ".fill") == 0))
     {
-        ln->extra = rest ? strdup(rest) : NULL;
-        return ln;
+        line->extra = rest ? strdup(rest) : NULL;
+        return line;
     }
 
     /* else: instruction */
-    ln->op = parse_operand(rest);
+    line->op = parse_operand(rest);
 
     /* If no operand provided, but the mnemonic supports accumulator addressing,
      * default to AM_ACCUMULATOR to allow forms like "ASL"/"LSR"/"ROL"/"ROR". */
-    if ((!rest || *rest == '\0') && ln->op.mode == AM_NONE) {
-        const opcode_t *acc = opcode_lookup(ln->mnemonic, AM_ACCUMULATOR);
+    if ((!rest || *rest == '\0') && line->op.mode == AM_NONE) {
+        const opcode_t *acc = opcode_lookup(line->mnemonic, AM_ACCUMULATOR);
         if (acc) {
-            ln->op.mode = AM_ACCUMULATOR;
+            line->op.mode = AM_ACCUMULATOR;
         }
     }
 
     /* Branch mnemonics always use relative addressing */
-    if (ln->mnemonic &&
-            (strcasecmp(ln->mnemonic, "bcc") == 0 ||
-             strcasecmp(ln->mnemonic, "bcs") == 0 ||
-             strcasecmp(ln->mnemonic, "beq") == 0 ||
-             strcasecmp(ln->mnemonic, "bmi") == 0 ||
-             strcasecmp(ln->mnemonic, "bne") == 0 ||
-             strcasecmp(ln->mnemonic, "bpl") == 0 ||
-             strcasecmp(ln->mnemonic, "bvc") == 0 ||
-             strcasecmp(ln->mnemonic, "bvs") == 0))
+    if (line->mnemonic &&
+            (strcasecmp(line->mnemonic, "bcc") == 0 ||
+             strcasecmp(line->mnemonic, "bcs") == 0 ||
+             strcasecmp(line->mnemonic, "beq") == 0 ||
+             strcasecmp(line->mnemonic, "bmi") == 0 ||
+             strcasecmp(line->mnemonic, "bne") == 0 ||
+             strcasecmp(line->mnemonic, "bpl") == 0 ||
+             strcasecmp(line->mnemonic, "bvc") == 0 ||
+             strcasecmp(line->mnemonic, "bvs") == 0))
     {
-        ln->op.mode = AM_RELATIVE;
+        line->op.mode = AM_RELATIVE;
     }
 
-    return ln;
+    return line;
 }
 
 /* ---------------- Include expansion loader ---------------- */
 
-static void free_line(asm_line_t *ln)
+static void free_line(asm_line_t *line)
 {
-    if (!ln) {
+    if (!line) {
         return;
     }
 
-    if (ln->filename) {
-        free(ln->filename);
+    if (line->filename) {
+        free(line->filename);
     }
 
-    if (ln->label) {
-        free(ln->label);
+    if (line->label) {
+        free(line->label);
     }
 
-    if (ln->mnemonic) {
-        free(ln->mnemonic);
+    if (line->mnemonic) {
+        free(line->mnemonic);
     }
 
-    if (ln->op.expr) {
-        free(ln->op.expr);
+    if (line->op.expr) {
+        free(line->op.expr);
     }
 
-    if (ln->extra) {
-        free(ln->extra);
+    if (line->extra) {
+        free(line->extra);
     }
 
-    if (ln->def_name) {
-        free(ln->def_name);
+    if (line->def_name) {
+        free(line->def_name);
     }
 
-    if (ln->def_expr) {
-        free(ln->def_expr);
+    if (line->def_expr) {
+        free(line->def_expr);
     }
 
-    free(ln);
+    free(line);
 }
 
-static void expand_include(const char *including_path, const char *arg, int lineno)
+static void expand_include(const char *including_path, const char *argument, int lineno)
 {
-    if (!arg) {
+    if (!argument) {
         asm_error_file(including_path, lineno, "Missing filename for .include");
     }
 
     char fnbuf[STRING_BUF];
 
-    strncpy(fnbuf, arg, sizeof(fnbuf) - 1);
+    strncpy(fnbuf, argument, sizeof(fnbuf) - 1);
     fnbuf[sizeof(fnbuf) - 1] = '\0';
 
     char *fn = trimws(fnbuf);
@@ -3010,60 +3036,61 @@ static void expand_include(const char *including_path, const char *arg, int line
     read_file_with_includes(resolved);
 }
 
-static void read_file_with_includes(const char *path)
+/* Read a source file and expand .include and macros into the global lines[]. */
+static void read_file_with_includes(const char *input_path)
 {
-    if (!path) {
+    if (!input_path) {
         return;
     }
 
     if (include_depth >= MAX_INCLUDE_DEPTH) {
-        fprintf(stderr, "Error: include nesting too deep while opening %s\n", path);
+        fprintf(stderr, "Error: include nesting too deep while opening %s\n", input_path);
         exit(1);
     }
 
-    FILE *fin = fopen(path, "r");
-    if (!fin) {
-        fprintf(stderr, "Error (open %s): %s\n", path, strerror(errno));
+    FILE *input_file = fopen(input_path, "r");
+    if (!input_file) {
+        fprintf(stderr, "Error (open %s): %s\n", input_path, strerror(errno));
         exit(1);
     }
 
     include_depth++;
 
-    char linebuf[MAX_LINE_LEN];
-    int lineno = 0;
+    char line_buf[MAX_LINE_LEN];
+    int line_no = 0;
 
-    while (fgets(linebuf, sizeof(linebuf), fin)) {
-        lineno++;
+    while (fgets(line_buf, sizeof(line_buf), input_file)) {
+        line_no++;
         /* remove trailing newline */
-        size_t L = strlen(linebuf);
-        if (L && (linebuf[L-1] == '\n' || linebuf[L-1] == '\r')) {
-            linebuf[L-1] = '\0';
+        size_t L = strlen(line_buf);
+        if (L && (line_buf[L-1] == '\n' || line_buf[L-1] == '\r')) {
+            line_buf[L-1] = '\0';
         }
 
         /* Macro definition? If so, it consumes its block and does not emit a line. */
-        if (macro_try_define(fin, path, linebuf, &lineno)) {
+        if (macro_try_define(input_file, input_path, line_buf, &line_no)) {
             continue;
         }
 
         /* Macro invocation? Expand into lines immediately. */
-        if (macro_try_expand_and_emit(path, linebuf, lineno)) {
+        if (macro_try_expand_and_emit(input_path, line_buf, line_no)) {
             continue;
         }
 
         /* Normal line path */
-        asm_line_t *ln = parse_line(linebuf, lineno);
+        asm_line_t *ln = parse_line(line_buf, line_no);
         if (!ln) {
             continue;
         }
 
         /* attach source filename */
-        ln->filename = strdup(path);
+        ln->filename = strdup(input_path);
 
         /* Expand include directives inline */
         if (ln->mnemonic &&
             (strcasecmp(ln->mnemonic, ".include") == 0))
         {
-            expand_include(path, ln->extra, lineno);
+            expand_include(input_path, ln->extra, line_no);
             free_line(ln);
             continue;
         }
@@ -3071,21 +3098,44 @@ static void read_file_with_includes(const char *path)
         lines[line_count++] = ln;
 
         if (line_count >= MAX_LINES) {
-            asm_error_file(path, lineno, "Too many lines in input");
+            asm_error_file(input_path, line_no, "Too many lines in input");
         }
     }
 
-    fclose(fin);
+    fclose(input_file);
     include_depth--;
 }
 
 /* Main */
 /* Program entry: parse CLI, read file, assemble (two-pass), write output. */
+/* Comparator for qsort: compare symbol indices by
+ * 1) address, 2) type (labels before defines), 3) name. */
+static int compare_symbol_indices_by_addr_type_name(const void *a, const void *b)
+{
+    int ia = *(const int*)a;
+    int ib = *(const int*)b;
+    int addr_a = symtab[ia].addr & 0xFFFF;
+    int addr_b = symtab[ib].addr & 0xFFFF;
+
+    if (addr_a != addr_b) {
+        return (addr_a < addr_b) ? -1 : 1;
+    }
+    /* At same address, order labels before defines */
+    int is_label_a = symtab[ia].is_label ? 1 : 0;
+    int is_label_b = symtab[ib].is_label ? 1 : 0;
+    if (is_label_a != is_label_b) {
+        return (is_label_a > is_label_b) ? -1 : 1; /* label (1) comes before define (0) */
+    }
+
+    return strcmp(symtab[ia].name, symtab[ib].name);
+}
+
 int main(int argc, char **argv)
 {
     int write_header = 1; /* default: write 2-byte load address */
     const char *in_path = NULL;
     const char *out_path = NULL;
+    const char *map_path = NULL; /* optional symbol map output */
 
     /* Parse flags */
     for (int i = 1; i < argc; i++) {
@@ -3097,11 +3147,18 @@ int main(int argc, char **argv)
             write_header = 0;
         } else if (strcmp(a, "--illegal-opcodes") == 0 || strcmp(a, "-I") == 0) {
             allow_illegal = 1;
+        } else if (strcmp(a, "--map") == 0 || strcmp(a, "-M") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Option %s requires a file path\n", a);
+                return 1;
+            }
+            map_path = argv[++i];
         } else if (a[0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", a);
             fprintf(stderr,
                     "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
-                    "[--illegal-opcodes|-I] input.asm output.bin\n",
+                    "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
+                    "input.asm output.bin\n",
                     argv[0]);
             return 1;
         } else if (!in_path) {
@@ -3112,7 +3169,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "Unexpected argument: %s\n", a);
             fprintf(stderr,
                     "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
-                    "[--illegal-opcodes|-I] input.asm output.bin\n",
+                    "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
+                    "input.asm output.bin\n",
                     argv[0]);
             return 1;
         }
@@ -3121,7 +3179,8 @@ int main(int argc, char **argv)
     if (!in_path || !out_path) {
         fprintf(stderr,
                 "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
-                "[--illegal-opcodes|-I] input.asm output.bin\n",
+                "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
+                "input.asm output.bin\n",
                 argv[0]);
         return 1;
     }
@@ -3164,6 +3223,46 @@ int main(int argc, char **argv)
     } else {
         printf("Assembled %d bytes from $%04X to $%04X (raw)\n", len,
                 out_lo, out_hi);
+    }
+
+    /* Optional: emit symbol map file if requested. */
+    if (map_path) {
+        /* Build an index array and sort by address, then by name for stability. */
+        int *sorted_indices = malloc(sizeof(int) * (size_t)sym_count);
+        if (!sorted_indices) {
+            perror("malloc map indices");
+            return 1;
+        }
+        for (int sym_i = 0; sym_i < sym_count; ++sym_i) {
+            sorted_indices[sym_i] = sym_i;
+        }
+
+        qsort(sorted_indices, (size_t)sym_count, sizeof(int), compare_symbol_indices_by_addr_type_name);
+
+        FILE *map_file = fopen(map_path, "w");
+        if (!map_file) {
+            fprintf(stderr, "Error: cannot open map file %s: %s\n", map_path, strerror(errno));
+            free(sorted_indices);
+            return 1;
+        }
+
+        /* Header: describe columns */
+        fprintf(map_file, "; $ADDR TYPE SCOPE NAME\n");
+        /* Format: $ADDR TYPE SCOPE NAME  (TYPE is 'label' or 'define'; SCOPE is scope depth) */
+        for (int out_i = 0; out_i < sym_count; ++out_i) {
+            int sym_index = sorted_indices[out_i];
+            const char *type_str = symtab[sym_index].is_label ? "label" : "define";
+            int scope_depth_for_map = symtab[sym_index].is_label ? symtab[sym_index].scope_depth : 0;
+            fprintf(map_file, "$%04X %s %d %s\n",
+                    symtab[sym_index].addr & 0xFFFF,
+                    type_str,
+                    scope_depth_for_map,
+                    symtab[sym_index].name);
+        }
+
+        fclose(map_file);
+        free(sorted_indices);
+        printf("Wrote symbol map: %s\n", map_path);
     }
 
     return 0;
