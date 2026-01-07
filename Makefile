@@ -7,7 +7,7 @@ ifeq ($(DEBUG),1)
 CFLAGS += -DDEBUG
 endif
 
-.PHONY: all clean test test-illegal
+.PHONY: all clean test test-illegal test-compare
 
 all: $(TARGET)
 
@@ -20,5 +20,9 @@ test: $(TARGET) test.asm
 test-illegal: $(TARGET) illegal.asm
 	./$(TARGET) --illegal-opcodes illegal.asm illegal.bin
 
+test-compare: all
+	python3 tools/compare_assemblers.py
+
 clean:
 	rm -f $(TARGET) test.bin illegal.bin
+	rm -rf build
