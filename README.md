@@ -7,9 +7,10 @@ Overview
 
 Quick Start
 - Build: 'make'
-- Assemble: './assembler input.asm output.bin'
+- Assemble: './assembler input.asm [output.bin]'
 - With PRG header (default): first two bytes are the load address.
-- Without header: './assembler --no-prg-header input.asm output.bin'
+- Without header: './assembler --no-prg-header input.asm [output.bin]'
+- Default output: if no output is provided, the output file uses the input name with a '.out' extension.
 
 Directives
 - '.org expr' and '* = expr': set program counter to 'expr'.

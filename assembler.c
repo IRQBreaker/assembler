@@ -3135,6 +3135,7 @@ int main(int argc, char **argv)
     int write_header = 1; /* default: write 2-byte load address */
     const char *in_path = NULL;
     const char *out_path = NULL;
+    char *out_path_alloc = NULL;
     const char *map_path = NULL; /* optional symbol map output */
 
     /* Parse flags */
@@ -3158,7 +3159,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
                     "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
-                    "input.asm output.bin\n",
+                    "input.asm [output.bin]\n",
                     argv[0]);
             return 1;
         } else if (!in_path) {
@@ -3170,19 +3171,37 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
                     "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
-                    "input.asm output.bin\n",
+                    "input.asm [output.bin]\n",
                     argv[0]);
             return 1;
         }
     }
 
-    if (!in_path || !out_path) {
+    if (!in_path) {
         fprintf(stderr,
                 "Usage: %s [--prg-header|-H] [--no-prg-header|-N] "
                 "[--illegal-opcodes|-I] [--map <file>|-M <file>] "
-                "input.asm output.bin\n",
+                "input.asm [output.bin]\n",
                 argv[0]);
         return 1;
+    }
+    if (!out_path) {
+        size_t in_len = strlen(in_path);
+        const char *slash = strrchr(in_path, '/');
+        const char *base = slash ? slash + 1 : in_path;
+        const char *dot = strrchr(base, '.');
+        size_t prefix_len = in_len;
+        if (dot && dot > base && dot[1] != '\0') {
+            prefix_len = (size_t)(dot - in_path);
+        }
+        out_path_alloc = malloc(prefix_len + 5);
+        if (!out_path_alloc) {
+            perror("malloc output path");
+            return 1;
+        }
+        memcpy(out_path_alloc, in_path, prefix_len);
+        memcpy(out_path_alloc + prefix_len, ".out", 5);
+        out_path = out_path_alloc;
     }
 
     macro_init();
@@ -3200,6 +3219,7 @@ int main(int argc, char **argv)
     FILE *fout = fopen(out_path, "wb");
     if (!fout) {
         perror("fopen output");
+        free(out_path_alloc);
         return 1;
     }
 
@@ -3231,6 +3251,7 @@ int main(int argc, char **argv)
         int *sorted_indices = malloc(sizeof(int) * (size_t)sym_count);
         if (!sorted_indices) {
             perror("malloc map indices");
+            free(out_path_alloc);
             return 1;
         }
         for (int sym_i = 0; sym_i < sym_count; ++sym_i) {
@@ -3243,6 +3264,7 @@ int main(int argc, char **argv)
         if (!map_file) {
             fprintf(stderr, "Error: cannot open map file %s: %s\n", map_path, strerror(errno));
             free(sorted_indices);
+            free(out_path_alloc);
             return 1;
         }
 
@@ -3265,5 +3287,6 @@ int main(int argc, char **argv)
         printf("Wrote symbol map: %s\n", map_path);
     }
 
+    free(out_path_alloc);
     return 0;
 }
