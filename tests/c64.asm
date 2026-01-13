@@ -1,3 +1,9 @@
+.include ../c64/c64_defines.asm
+
+BasicStart()
+
+jmp start
+
 * = $c000
 
 start:
