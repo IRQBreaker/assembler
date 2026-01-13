@@ -23,9 +23,6 @@ test-illegal: $(TARGET) tests/illegal.asm
 test-c64: $(TARGET) tests/c64.asm
 	./$(TARGET) tests/c64.asm tests/c64.prg
 
-test-compare: all
-	python3 tools/compare_assemblers.py
-
 clean:
 	rm -f $(TARGET) tests/test.bin tests/illegal.bin tests/c64.prg
 	rm -rf build
